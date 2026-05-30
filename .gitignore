@@ -1,0 +1,25 @@
+.env
+.env.credentials
+app/.env
+app/.env.credentials
+app/data/private/
+app/data/logs/
+app/data/reports/
+app/data/debug/
+browser/user_data/
+browser/User Data/
+runtime/
+screenshots/
+recordings/
+downloads/
+generated_images/
+__pycache__/
+*.pyc
+*.log
+*.xlsx
+*.json
+!update_config.json
+!latest.json
+!app/update_config.json
+dist/
+backups/
