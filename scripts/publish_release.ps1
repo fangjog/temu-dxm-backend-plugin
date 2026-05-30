@@ -64,7 +64,7 @@ try { gh release view $Tag *> $null; $ExistingRelease = $true } catch {}
 if ($ExistingRelease) {
   gh release upload $Tag $Zip $Latest --clobber
 } else {
-  gh release create $Tag $Zip $Latest --title $Tag --notes "初始可迁移版本"
+  gh release create $Tag $Zip $Latest --title $Tag --notes "Initial portable plugin release"
 }
 
 gh release view $Tag --web
