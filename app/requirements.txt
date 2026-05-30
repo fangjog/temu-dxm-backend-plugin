@@ -1,0 +1,9 @@
+playwright
+python-dotenv
+pyyaml
+openai
+pandas
+openpyxl
+pillow
+requests
+cryptography

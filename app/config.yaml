@@ -1,0 +1,45 @@
+browser:
+  headless: false
+  slow_mo: 120
+  timeout: 60000
+easyrouter:
+  base_url: https://easyrouter.io/v1
+  temperature: 0.3
+  max_tokens: 800
+dxm_publish_twice:
+  source_product_count: 4
+  target_title: ''
+  retry_on_verify_failure: true
+product_defaults:
+  origin_country: 中国大陆
+  origin_provinces:
+  - 广东省
+  submit_mode: draft
+  default_length_cm: 10
+  default_width_cm: 10
+  default_height_cm: 3
+  weight_min_g: 30
+  weight_max_g: 99
+  package_shape: 规则
+  package_type: 软包装+软物
+  default_color: 白色
+  fallback_color: 其他色
+  default_material: 其他
+  default_flower_type: 无印花
+publish:
+  allow_publish: true
+  click_immediate_publish: true
+  verify_status_after_publish: true
+  wait_after_publish_seconds: 10
+sku:
+  allow_chars_regex: '[^A-Za-z0-9_-]'
+  max_length: 80
+  uppercase: true
+safety:
+  stop_on_captcha: true
+  screenshot_on_error: true
+  auto_publish: false
+  auto_publish_only_in_publish_one: true
+  stop_on_required_error: true
+  screenshot_before_publish: true
+  screenshot_after_publish: true
