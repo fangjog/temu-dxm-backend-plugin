@@ -88,6 +88,7 @@ def main() -> int:
     }
     latest_path = DIST / "latest.json"
     _write_json(latest_path, latest)
+    _write_json(ROOT / "latest.json", latest)
     print(json.dumps({"zip_path": str(zip_path), "latest_json_path": str(latest_path), "sha256": sha}, ensure_ascii=False, indent=2))
     return 0
 

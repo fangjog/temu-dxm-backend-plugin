@@ -1,7 +1,7 @@
 {
   "version": "0.1.0",
-  "package_url": "https://github.com/<owner>/temu-dxm-backend-plugin/releases/download/v0.1.0/temu_dxm_backend_plugin_v0.1.0.zip",
-  "sha256": "d29ac209620d7fc82afa0b03c94e0e088888745f64f2e321cb25940df296f473",
+  "package_url": "https://github.com/fangjog/temu-dxm-backend-plugin/releases/download/v0.1.0/temu_dxm_backend_plugin_v0.1.0.zip",
+  "sha256": "7731d584ca023cff6ef393643aa1d876a21b46278d8d31580a77ed64f9197572",
   "notes": "初始可迁移版本",
   "force_update": false
 }
