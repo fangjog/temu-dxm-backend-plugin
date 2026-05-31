@@ -7,7 +7,7 @@ easyrouter:
   temperature: 0.3
   max_tokens: 800
 dxm_publish_twice:
-  source_product_count: 4
+  source_product_count: 1
   target_title: ''
   retry_on_verify_failure: true
 product_defaults:

@@ -259,8 +259,25 @@ def run_publish_current_edit_page(
             "url": page.url,
         }
 
-        dimensions = fill_variant_dimensions_and_weight(page, config, logger=logger)
-        package = fill_package_info_required(page, product_id, config, logger=logger)
+        dimension_info = extract_dimensions_from_product_images(page, product_data)
+        dimensions = fill_variant_dimensions_and_weight_from_images(page, dimension_info, logger=logger)
+        product_data.update(
+            raw_dimension_text=dimension_info.get("raw_dimension_text", ""),
+            length_cm=dimension_info.get("length_cm", ""),
+            width_cm=dimension_info.get("width_cm", ""),
+            height_cm=dimension_info.get("height_cm", ""),
+            weight_g=dimension_info.get("weight_g", ""),
+            size_weight_source=dimension_info.get("source", ""),
+            dimension_candidate_index=dimension_info.get("dimension_candidate_index", ""),
+            dimension_candidate_src=dimension_info.get("dimension_candidate_src", ""),
+        )
+        package = choose_package_image_with_dimension_priority(page, {**product_data, **dimension_info})
+        if package.get("status") not in {"ok", "selected"}:
+            fallback_package = fill_package_info_required(page, product_id, config, logger=logger)
+            package = {**fallback_package, "priority_attempt": package, "package_image_source": fallback_package.get("package_image_source", "fallback_random")}
+        else:
+            fill_package_shape_and_type_required(page, config, logger=logger)
+        product_data["package_image_source"] = package.get("package_image_source", "fallback_random")
         attributes = fill_required_product_attributes(page, product_data, config, logger=logger)
         size_chart = fill_size_chart_required(page, product_data, config, logger=logger)
         description_image = ensure_product_description_image_module(page, product_data, config, logger=logger)
@@ -319,10 +336,69 @@ def run_publish_current_edit_page(
                 page.keyboard.press("Escape")
             except Exception:
                 pass
+            retry_variant_preview: dict[str, Any] = {}
+            retry_product_carousel: dict[str, Any] = {}
+            required_text = json.dumps(dialogs.get("required_errors", []), ensure_ascii=False)
+            product_carousel_required = (
+                any(term in required_text for term in ("\u4ea7\u54c1\u8f6e\u64ad\u56fe", "\u8f6e\u64ad\u56fe", "\u4ea7\u54c1\u56fe\u7247", "\u4e3b\u56fe"))
+                and any(term in required_text for term in ("1:1", "1x1", "800"))
+            )
+            variant_preview_required = any(term in required_text for term in ("\u53d8\u79cd\u9884\u89c8\u56fe", "SKU\u56fe\u7247", "SKU \u56fe\u7247"))
+            if product_carousel_required:
+                try:
+                    from .dxm_publish_twice_flow import _set_selected_images_square_800
+
+                    retry_product_carousel = _set_selected_images_square_800(
+                        page,
+                        stage="publish_retry_product_carousel",
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    retry_product_carousel = {"status": "failed", "message": str(exc)}
+            if variant_preview_required:
+                try:
+                    from .dxm_publish_twice_flow import _ensure_variant_preview_images_square_800
+
+                    retry_variant_preview = _ensure_variant_preview_images_square_800(
+                        page,
+                        stage="publish_retry_variant_preview",
+                        logger=logger,
+                        add_missing=True,
+                    )
+                except Exception as exc:
+                    retry_variant_preview = {"status": "failed", "message": str(exc)}
+            if (
+                "产品轮播图" in required_text
+                or "轮播图" in required_text
+                or "产品图片" in required_text
+                or "主图" in required_text
+            ) and ("1:1" in required_text or "1x1" in required_text or "800" in required_text):
+                try:
+                    from .dxm_publish_twice_flow import _set_selected_images_square_800
+
+                    retry_product_carousel = _set_selected_images_square_800(
+                        page,
+                        stage="publish_retry_product_carousel",
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    retry_product_carousel = {"status": "failed", "message": str(exc)}
+            if "变种预览图" in required_text or "SKU图片" in required_text or "SKU 图片" in required_text:
+                try:
+                    from .dxm_publish_twice_flow import _ensure_variant_preview_images_square_800
+
+                    retry_variant_preview = _ensure_variant_preview_images_square_800(
+                        page,
+                        stage="publish_retry_variant_preview",
+                        logger=logger,
+                        add_missing=True,
+                    )
+                except Exception as exc:
+                    retry_variant_preview = {"status": "failed", "message": str(exc)}
             retry_description_image = ensure_product_description_image_module(page, product_data, config, logger=logger)
             retry_attributes = fill_required_product_attributes(page, product_data, config, logger=logger)
             retry_ensure = ensure_no_required_errors_before_publish(page, config, product_data, logger=logger, state=state)
-            retry_after_dialog_errors = {"description_image": retry_description_image, "attributes": retry_attributes, "ensure": retry_ensure}
+            retry_after_dialog_errors = {"product_carousel": retry_product_carousel, "variant_preview": retry_variant_preview, "description_image": retry_description_image, "attributes": retry_attributes, "ensure": retry_ensure}
             if retry_ensure.get("status") == "ok":
                 click_result = click_immediate_publish(page, config, logger=logger)
                 dialogs = handle_publish_dialogs(page, logger=logger)
@@ -587,14 +663,21 @@ def choose_package_image_with_dimension_priority(page: Any, context: dict[str, A
         return {**open_result, "selected_index": 0, "has_dimension_mark": False, "package_image_source": "fallback_random", "selected_image_text": ""}
 
     preferred_src = str(context.get("dimension_candidate_src") or "")
+    preferred_index = int(context.get("dimension_candidate_index") or 0)
+    dimension_ocr_text = " ".join(
+        str(item.get("combined_text", ""))
+        for item in context.get("image_ocr_items", [])
+        if isinstance(item, dict) and (not preferred_index or int(item.get("index", 0) or 0) == preferred_index)
+    )
     selected = page.evaluate(
-        """({preferredSrc}) => {
+        """({preferredSrc, preferredIndex, dimensionOcrText}) => {
             const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
             const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
             const modals = Array.from(document.querySelectorAll('.ant-modal')).filter(visible);
             const modal = modals.find((el) => textOf(el).includes('引用采集图片')) || modals[modals.length - 1];
             if (!modal) return {status: 'manual_required', message: '引用采集图片弹窗未打开'};
-            const dimensionRe = /(\\d+(?:\\.\\d+)?\\s*(?:x|X|×|\\*)\\s*\\d+(?:\\.\\d+)?\\s*(?:mm|cm|毫米|厘米)\\b|800\\s*(?:x|X|×|\\*)\\s*800|\\b\\d+(?:\\.\\d+)?\\s*(?:mm|cm|毫米|厘米|g|kg|克|千克|cc)\\b|detail display|size|dimension|caliber|diameter|volume|depth|upper caliber|bottom diameter|single volume|尺寸|规格|参数|参数表|尺寸表|宽|高|厚|深)/i;
+            const dimensionRe = /(\\d+(?:\\.\\d+)?\\s*(?:x|X|×|\\*)\\s*\\d+(?:\\.\\d+)?\\s*(?:mm|cm|毫米|厘米)\\b|\\b\\d+(?:\\.\\d+)?\\s*(?:mm|cm|毫米|厘米|g|kg|克|千克|cc)\\b|detail display|size|dimension|parameter|caliber|diameter|volume|depth|upper caliber|bottom diameter|single volume|尺寸|规格|参数|参数表|尺寸表|宽|高|厚|深)/i;
+            const pixelOnlyRe = /^\\s*(800|1000|1200|1340|1500|1785)\\s*(?:x|X|×|\\*)\\s*(800|1000|1200|1340|1500|1785)\\s*$/i;
             const boxes = Array.from(modal.querySelectorAll('input[type="checkbox"]')).filter((box) => box.value && box.value !== 'on' && !box.disabled);
             const items = boxes.map((box, index) => {
                 const root = box.closest('label,li,div[class*="item"],div[class*="image"],div[class*="img"],tr,div') || box.parentElement || box;
@@ -609,10 +692,13 @@ def choose_package_image_with_dimension_priority(page: Any, context: dict[str, A
                 ].join(' ').replace(/\\s+/g, ' ').trim();
                 let score = 0;
                 const preferredMatch = !!(preferredSrc && src && (src === preferredSrc || src.includes(preferredSrc.split('/').pop() || '__never__')));
-                const hasDimension = dimensionRe.test(text) || preferredMatch;
+                const preferredIndexMatch = !!(preferredIndex && Number(preferredIndex) === index + 1);
+                const ocrHit = preferredIndexMatch && dimensionRe.test(String(dimensionOcrText || ''));
+                const hasDimension = (dimensionRe.test(text) && !pixelOnlyRe.test(text)) || preferredMatch || preferredIndexMatch || ocrHit;
                 if (hasDimension) score += 100;
                 if (preferredMatch) score += 80;
-                if (!hasDimension && /800\\s*(?:x|X|×|\\*)\\s*800/.test(text)) score += 20;
+                if (preferredIndexMatch) score += 70;
+                if (ocrHit) score += 50;
                 if (img && img.naturalWidth >= 500 && img.naturalHeight >= 500) score += 5;
                 return {box, root, img, src, text, index: index + 1, score, hasDimension};
             });
@@ -635,10 +721,14 @@ def choose_package_image_with_dimension_priority(page: Any, context: dict[str, A
                 package_image_source: picked.hasDimension ? 'dimension_marked_image' : 'fallback_random'
             };
         }""",
-        {"preferredSrc": preferred_src},
+        {"preferredSrc": preferred_src, "preferredIndex": preferred_index, "dimensionOcrText": dimension_ocr_text},
     )
     if selected.get("status") != "selected":
         return {**selected, "selected_index": 0, "has_dimension_mark": False, "package_image_source": "fallback_random", "selected_image_text": ""}
+    if dimension_ocr_text and int(selected.get("selected_index", 0) or 0) == preferred_index:
+        selected["selected_image_text"] = " ".join([str(selected.get("selected_image_text", "")), str(dimension_ocr_text)]).strip()[:1200]
+        selected["has_dimension_mark"] = True
+        selected["package_image_source"] = "dimension_marked_image"
     page.wait_for_timeout(500)
     try:
         confirm = page.locator('.ant-modal:has-text("引用采集图片") button:has-text("选择")').last
@@ -654,19 +744,27 @@ def choose_package_image_with_dimension_priority(page: Any, context: dict[str, A
 def _parse_dimension_text(raw_text: str) -> dict[str, Any]:
     text = re.sub(r"\s+", " ", str(raw_text or "")).strip()
     dimension_pairs: list[tuple[float, float, str]] = []
-    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:x|X|×|\*)\s*(\d+(?:\.\d+)?)\s*(mm|cm|毫米|厘米|px)?", text):
+    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:x|X|×|\*)\s*(\d+(?:\.\d+)?)\s*(mm|cm|毫米|厘米|px)?", text, flags=re.IGNORECASE):
         unit = (match.group(3) or "").lower()
         first = float(match.group(1))
         second = float(match.group(2))
         if unit == "px" or (not unit and first >= 700 and second >= 700):
             continue
+        if first == second and first >= 700:
+            continue
         dimension_pairs.append((first, second, unit))
 
     singles: list[tuple[float, str, str]] = []
-    for match in re.finditer(r"(?:(depth|height|thick|thickness|高|厚|深|宽|长)\\s*[:：]?\s*)?(\d+(?:\.\d+)?)\s*(mm|cm|毫米|厘米|g|kg|克|千克|cc)\b", text, flags=re.IGNORECASE):
+    label_before = r"(depth|height|thick|thickness|caliber|diameter|volume|upper caliber|bottom diameter|single volume|高|厚|深|宽|长|口径|直径|容量)"
+    for match in re.finditer(rf"(?:{label_before}\s*[:：]?\s*)?(\d+(?:\.\d+)?)\s*(mm|cm|毫米|厘米|g|kg|克|千克|cc)\b", text, flags=re.IGNORECASE):
         label = (match.group(1) or "").lower()
         value = float(match.group(2))
         unit = match.group(3).lower()
+        singles.append((value, unit, label))
+    for match in re.finditer(rf"(\d+(?:\.\d+)?)\s*(mm|cm|毫米|厘米|g|kg|克|千克|cc)\s*(?:{label_before})", text, flags=re.IGNORECASE):
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        label = (match.group(3) or "").lower()
         singles.append((value, unit, label))
 
     def to_cm(value: float, unit: str) -> float:
@@ -674,7 +772,7 @@ def _parse_dimension_text(raw_text: str) -> dict[str, Any]:
             return value / 10
         if unit in {"cm", "厘米"}:
             return value
-        return value / 10 if value > 100 else value
+        return value / 10 if value > 80 else value
 
     length_cm = width_cm = height_cm = None
     raw_dimension_text = ""
@@ -695,6 +793,28 @@ def _parse_dimension_text(raw_text: str) -> dict[str, Any]:
                 raw_dimension_text = f"{label or 'height'} {value:g}{unit}"
             break
 
+    # Some product images only show one physical length, e.g. "55cm / 21.7in".
+    # Treat that as product length and keep width/height on conservative fallbacks.
+    # Do not infer product length from small unlabeled mm values such as 34mm/15mm.
+    if not length_cm and not width_cm:
+        length_candidates: list[tuple[float, str, str]] = []
+        for value, unit, label in singles:
+            if unit in {"g", "克", "kg", "千克", "cc"}:
+                continue
+            if label in {"depth", "height", "thick", "thickness", "高", "厚", "深", "width", "宽", "caliber", "diameter", "口径", "直径"}:
+                continue
+            cm_value = to_cm(value, unit)
+            if unit in {"cm", "厘米"} and cm_value >= 8:
+                length_candidates.append((cm_value, f"{value:g}{unit}", label))
+            elif unit in {"mm", "毫米"} and cm_value >= 8:
+                length_candidates.append((cm_value, f"{value:g}{unit}", label))
+        if length_candidates:
+            length_cm, raw_value, label = max(length_candidates, key=lambda item: item[0])
+            width_cm = 8
+            if not height_cm:
+                height_cm = 4
+            raw_dimension_text = f"{label + ' ' if label else ''}{raw_value}".strip()
+
     weight_g = None
     for value, unit, label in singles:
         if unit in {"g", "克"}:
@@ -705,7 +825,7 @@ def _parse_dimension_text(raw_text: str) -> dict[str, Any]:
             break
 
     if length_cm and width_cm:
-        source = "image_dimension_detected" if weight_g else "image_dimension_detected_weight_fallback"
+        source = "image_content_detected" if weight_g else "image_content_detected_weight_fallback"
         if not height_cm:
             height_cm = 4
         if not weight_g:
@@ -730,7 +850,16 @@ def _ocr_product_image_candidates(candidates: list[dict[str, Any]], context: dic
     debug_dir.mkdir(parents=True, exist_ok=True)
     items: list[dict[str, Any]] = []
     vision_disabled = False
-    for item in candidates[:12]:
+    vision_calls = 0
+    max_vision_calls = int(os.getenv("EASYROUTER_VISION_MAX_IMAGES", "3") or "3")
+    mark_pattern = re.compile(
+        r"(\d+(?:\.\d+)?\s*(?:x|X|×|\*)\s*\d+(?:\.\d+)?\s*(?:mm|cm|毫米|厘米)\b|"
+        r"\b\d+(?:\.\d+)?\s*(?:mm|cm|毫米|厘米|g|kg|克|千克|cc)\b|"
+        r"depth|height|caliber|diameter|volume|upper caliber|bottom diameter|single volume|"
+        r"size|dimension|parameter|detail display|尺寸|规格|参数|参数表|尺寸表|宽|高|厚|深)",
+        re.IGNORECASE,
+    )
+    for item in candidates[:8]:
         if not isinstance(item, dict):
             continue
         src = str(item.get("src") or "")
@@ -743,12 +872,15 @@ def _ocr_product_image_candidates(candidates: list[dict[str, Any]], context: dic
         vision_error = ""
         if image_path:
             windows_text, windows_error = _windows_ocr_image(image_path)
-            if not vision_disabled:
+            local_combined = " ".join([str(item.get("text", "")), windows_text])
+            needs_vision = not mark_pattern.search(local_combined)
+            if needs_vision and not vision_disabled and vision_calls < max_vision_calls:
+                vision_calls += 1
                 vision_text, vision_error = _easyrouter_image_ocr(image_path)
                 if vision_error and not vision_text:
                     vision_disabled = True
         combined = " ".join([str(item.get("text", "")), windows_text, vision_text]).strip()
-        has_mark = bool(re.search(r"(\d+(?:\.\d+)?\s*(?:x|X|×|\*)\s*\d+(?:\.\d+)?\s*(?:mm|cm|毫米|厘米)\b|\b\d+(?:\.\d+)?\s*(?:mm|cm|毫米|厘米|g|kg|克|千克|cc)\b|depth|height|caliber|diameter|volume|upper caliber|bottom diameter|single volume|尺寸|规格|参数|宽|高|厚|深)", combined, flags=re.IGNORECASE))
+        has_mark = bool(mark_pattern.search(combined))
         items.append({
             "index": item.get("index", 0),
             "src": src,
@@ -993,7 +1125,7 @@ def fill_size_chart_required(page: Any, product_data: dict[str, Any], config: di
         return {"status": "manual_required", "message": str(exc), "screenshot_path": screenshot_path}
 
 
-def fill_package_info_required(page: Any, product_id: str, config: dict[str, Any], logger: Any | None = None) -> dict[str, Any]:
+def fill_package_shape_and_type_required(page: Any, config: dict[str, Any], logger: Any | None = None) -> dict[str, Any]:
     defaults = config.get("product_defaults", {})
     _close_blocking_image_modals(page)
     shape = _select_ant_by_control_text(page, ["请选择外包装形状", "外包装形状"], [defaults.get("package_shape", "规则")], allow_first=True)
@@ -1005,24 +1137,39 @@ def fill_package_info_required(page: Any, product_id: str, config: dict[str, Any
         "软包装",
     ]
     package_type = _select_ant_by_control_text(page, ["请选择外包装类型", "外包装类型"], package_type_values, allow_first=True)
+    state = _read_package_state(page)
+    status = "ok" if state.get("shape_ok") and state.get("type_ok") else "manual_required"
+    _log(
+        logger,
+        "fill_package_shape_type_required",
+        status,
+        f"外包装形状/类型处理: shape={shape}, type={package_type}, state={state}",
+        page=page,
+        extra={"package_state": state},
+    )
+    return {"status": status, "shape": shape, "type": package_type, "state": state}
+
+
+def fill_package_info_required(page: Any, product_id: str, config: dict[str, Any], logger: Any | None = None) -> dict[str, Any]:
+    shape_type = fill_package_shape_and_type_required(page, config, logger=logger)
     upload_result = _choose_existing_package_image(page)
     image_path = None
     if upload_result.get("status") != "ok":
         image_path = _find_or_download_package_image(page, product_id)
         upload_result = _upload_package_image(page, image_path) if image_path else {"status": "manual_required", "message": "没有可用商品图片"}
     image_ok = _has_package_image(page)
-    status = "ok" if shape.get("status") == "ok" and package_type.get("status") == "ok" and image_ok else "manual_required"
+    status = "ok" if shape_type.get("status") == "ok" and image_ok else "manual_required"
     screenshot_path = "" if status == "ok" else take_screenshot(page, "package_info_required")
     _log(
         logger,
         "fill_package_info_required",
         status,
-        f"包装信息处理: shape={shape}, type={package_type}, image_ok={image_ok}, image_path={image_path}",
+        f"包装信息处理: shape={shape_type.get('shape')}, type={shape_type.get('type')}, image_ok={image_ok}, image_path={image_path}",
         page=page,
         screenshot_path=screenshot_path,
         extra={"product_id": product_id},
     )
-    return {"status": status, "shape": shape, "type": package_type, "image_path": str(image_path or ""), "upload": upload_result, "image_ok": image_ok, "screenshot_path": screenshot_path}
+    return {"status": status, "shape": shape_type.get("shape"), "type": shape_type.get("type"), "shape_type": shape_type, "image_path": str(image_path or ""), "upload": upload_result, "image_ok": image_ok, "screenshot_path": screenshot_path}
 
 
 def ensure_product_description_image_module(
@@ -1376,8 +1523,15 @@ def scan_required_errors(page: Any) -> list[dict[str, str]]:
 def ensure_no_required_errors_before_publish(page: Any, config: dict[str, Any], product_data: dict[str, Any], logger: Any | None = None, state: Any | None = None) -> dict[str, Any]:
     errors = scan_required_errors(page)
     if errors:
-        fill_variant_dimensions_and_weight(page, config, logger=logger)
-        fill_package_info_required(page, product_data.get("product_id", "DXM"), config, logger=logger)
+        if any(str(product_data.get(key, "")).strip() for key in ("length_cm", "width_cm", "height_cm", "weight_g", "raw_dimension_text")):
+            fill_variant_dimensions_and_weight_from_images(page, product_data, logger=logger)
+        else:
+            fill_variant_dimensions_and_weight(page, config, logger=logger)
+        package_retry = choose_package_image_with_dimension_priority(page, product_data)
+        if package_retry.get("status") not in {"ok", "selected"}:
+            fill_package_info_required(page, product_data.get("product_id", "DXM"), config, logger=logger)
+        else:
+            fill_package_shape_and_type_required(page, config, logger=logger)
         fill_required_product_attributes(page, product_data, config, logger=logger)
         fill_size_chart_required(page, product_data, config, logger=logger)
         errors = scan_required_errors(page)
@@ -1756,13 +1910,15 @@ def _read_package_state(page: Any) -> dict[str, Any]:
                 if (img.closest('.ant-modal, .ant-dropdown, .ant-popover')) return false;
                 const y = img.getBoundingClientRect().y;
                 const src = img.currentSrc || img.src || '';
-                return y > headerY && y < nextY && src && !src.startsWith('data:') && !src.includes('loading');
+                if (!src || src.startsWith('data:') || src.includes('loading')) return false;
+                return root ? true : (y > headerY && y < nextY);
             });
             const backgroundImages = Array.from(imageRoot.querySelectorAll('*')).filter(visible).filter((el) => {
                 if (el.closest('.ant-modal, .ant-dropdown, .ant-popover')) return false;
                 const y = el.getBoundingClientRect().y;
                 const bg = getComputedStyle(el).backgroundImage || '';
-                return y > headerY && y < nextY && bg.includes('url(') && !bg.includes('data:') && !bg.includes('loading');
+                if (!bg.includes('url(') || bg.includes('data:') || bg.includes('loading')) return false;
+                return root ? true : (y > headerY && y < nextY);
             });
             return {
                 shape_text: shape ? shape.text : '',

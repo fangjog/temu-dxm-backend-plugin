@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import datetime
 
+import concurrent.futures
+
 
 import hashlib
 
@@ -55,10 +57,22 @@ from .publish_pages import (
     click_immediate_publish,
 
 
+    choose_package_image_with_dimension_priority,
+
+
+    extract_dimensions_from_product_images,
+
+
     fill_package_info_required,
 
 
+    fill_package_shape_and_type_required,
+
+
     fill_required_product_attributes,
+
+
+    fill_variant_dimensions_and_weight_from_images,
 
 
     fill_variant_dimensions_and_weight,
@@ -119,6 +133,23 @@ CONTINUE_PUBLISH_TEXTS = ["继续刊登"]
 
 
 
+
+
+# Keep these selector strings in escaped Unicode form so release packaging cannot
+# corrupt the Chinese text needed by the Dianxiaomi UI.
+SECOND_PUBLISH_TEXTS = [
+    "\u521b\u5efa\u65b0\u4ea7\u54c1(\u4fdd\u7559\u5df2\u586b\u5185\u5bb9)",
+    "\u521b\u5efa\u65b0\u4ea7\u54c1\uff08\u4fdd\u7559\u5df2\u586b\u5185\u5bb9\uff09",
+    "\u4fdd\u7559\u5df2\u586b\u5185\u5bb9",
+    "\u540c\u6b3e\u4e8c\u6b21\u53d1\u5e03",
+    "\u4e8c\u6b21\u53d1\u5e03",
+    "\u4e8c\u6b21\u7f16\u8f91",
+    "\u518d\u6b21\u53d1\u5e03",
+    "\u590d\u5236\u53d1\u5e03",
+    "\u521b\u5efa\u65b0\u4ea7\u54c1",
+]
+
+CONTINUE_PUBLISH_TEXTS = ["\u7ee7\u7eed\u520a\u767b"]
 
 
 class DxmTwiceFlowError(RuntimeError):
@@ -1615,9 +1646,6 @@ def run_second_publish_edit(
     sku_suffix_result = append_second_publish_sku_suffix(page, suffix=f"-B{sku_run_suffix}", logger=logger)
 
 
-    dimensions = fill_variant_dimensions_and_weight(page, config, logger=logger)
-
-
     product_data = {
 
 
@@ -1642,7 +1670,31 @@ def run_second_publish_edit(
     }
 
 
-    package = fill_package_info_required(page, product_id, config, logger=logger)
+    dimension_info = extract_dimensions_from_product_images(page, product_data)
+
+
+    dimensions = fill_variant_dimensions_and_weight_from_images(page, dimension_info, logger=logger)
+
+
+    product_data.update(
+        raw_dimension_text=dimension_info.get("raw_dimension_text", ""),
+        length_cm=dimension_info.get("length_cm", ""),
+        width_cm=dimension_info.get("width_cm", ""),
+        height_cm=dimension_info.get("height_cm", ""),
+        weight_g=dimension_info.get("weight_g", ""),
+        size_weight_source=dimension_info.get("source", ""),
+        dimension_candidate_index=dimension_info.get("dimension_candidate_index", ""),
+        dimension_candidate_src=dimension_info.get("dimension_candidate_src", ""),
+    )
+
+
+    package = choose_package_image_with_dimension_priority(page, {**product_data, **dimension_info})
+    if package.get("status") not in {"ok", "selected"}:
+        fallback_package = fill_package_info_required(page, product_id, config, logger=logger)
+        package = {**fallback_package, "priority_attempt": package, "package_image_source": fallback_package.get("package_image_source", "fallback_random")}
+    else:
+        fill_package_shape_and_type_required(page, config, logger=logger)
+    product_data["package_image_source"] = package.get("package_image_source", "fallback_random")
 
 
     attributes = fill_required_product_attributes(page, product_data, config, logger=logger)
@@ -1963,7 +2015,7 @@ def ensure_and_shuffle_product_images(
     set_800px: bool = True,
 
 
-    ensure_variant_preview: bool = True,
+    ensure_variant_preview: bool = False,
 
 
 ) -> dict[str, Any]:
@@ -2024,11 +2076,13 @@ def ensure_and_shuffle_product_images(
     )
 
 
-    variant_preview_800 = (
-        _ensure_variant_preview_images_square_800(page, stage=stage, logger=logger)
-        if ensure_variant_preview
-        else {"status": "skipped", "message": "Variant preview 800px check skipped for this stage."}
+    variant_preview_800 = _ensure_variant_preview_images_square_800(
+        page,
+        stage=stage,
+        logger=logger,
+        add_missing=bool(ensure_variant_preview or stage == "first_publish"),
     )
+    variant_preview_action = variant_preview_800.get("variant_preview_action", "failed")
 
 
     child_check = _check_selected_images_for_child_keywords(page, stage=stage, logger=logger)
@@ -2062,6 +2116,7 @@ def ensure_and_shuffle_product_images(
 
 
             "variant_preview_800": variant_preview_800,
+            "variant_preview_action": variant_preview_action,
 
 
             "before_screenshot": before_screenshot,
@@ -2149,6 +2204,7 @@ def ensure_and_shuffle_product_images(
 
 
         "variant_preview_800": variant_preview_800,
+        "variant_preview_action": variant_preview_action,
 
 
         "variant_preview_800_status": variant_preview_800.get("status", "unknown"),
@@ -2176,15 +2232,12 @@ def ensure_and_shuffle_product_images(
 
 
     if variant_preview_800.get("status") == "failed":
+        result["variant_preview_warning"] = variant_preview_800.get(
+            "message",
+            "Variant preview image 1:1 handling failed before publish; will rely on publish-time required-error retry.",
+        )
 
-
-        result["status"] = "failed"
-
-
-        result["message"] = variant_preview_800.get("message", "Variant preview image 1:1/800 handling failed.")
-
-
-    elif shuffle.get("status") == "skipped":
+    if shuffle.get("status") == "skipped":
 
 
         result["status"] = "skipped"
@@ -2330,25 +2383,187 @@ def _set_selected_images_square_800(page: Any, stage: str = "", logger: Any | No
         )
         if not isinstance(batch_clicked, dict) or not batch_clicked.get("ok"):
             return {"status": "skipped", "button": clicked, "batch": batch_clicked, "message": "batch image size item not found"}
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(3500)
+        try:
+            page.wait_for_selector(".ant-modal .ant-select-selector", timeout=12000)
+        except Exception:
+            pass
         python_selects: list[dict[str, Any]] = []
+
+        def choose_ant_select_option_by_index(select_index: int, option_index: int, label: str) -> None:
+            selector = page.locator(".ant-modal .ant-select").nth(select_index)
+            selector.click(timeout=10000, force=True)
+            page.wait_for_timeout(600)
+            option_result = page.evaluate(
+                """(optionIndex) => {
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const options = Array.from(document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option, .ant-select-item-option')).filter(visible);
+                    if (options.length <= optionIndex) return {ok: false, total: options.length, texts: options.map(textOf)};
+                    const target = options[optionIndex];
+                    target.style.width = target.style.width || '160px';
+                    target.style.height = target.style.height || '32px';
+                    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                        target.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, button: 0, buttons: type.endsWith('down') ? 1 : 0}));
+                    }
+                    return {ok: true, total: options.length, text: textOf(target)};
+                }
+                """,
+                option_index,
+            )
+            if not isinstance(option_result, dict) or not option_result.get("ok"):
+                raise RuntimeError(f"{label} option index {option_index} not found/clicked: {option_result}")
+            page.wait_for_timeout(1000)
+
         try:
-            page.locator(".ant-modal:visible .ant-select").nth(0).click(timeout=5000)
-            page.wait_for_timeout(500)
-            page.locator('.ant-select-dropdown:visible .ant-select-item-option[title="自定义比例调整"]').last.click(timeout=5000)
-            page.wait_for_timeout(900)
-            python_selects.append({"target": "自定义比例调整", "ok": True})
+            # Batch size editor: 0 = proportional resize, 1 = custom ratio resize.
+            choose_ant_select_option_by_index(0, 1, "custom_ratio")
+            python_selects.append({"target": "custom_ratio", "ok": True})
         except Exception as exc:
-            python_selects.append({"target": "自定义比例调整", "ok": False, "message": str(exc)})
+            python_selects.append({"target": "custom_ratio", "ok": False, "message": str(exc)})
+        python_selects.append({"target": "custom_width_height", "ok": True, "message": "skipped; custom ratio mode exposes width/height inputs directly"})
+        python_selects.append({"target": "batch_size_native_800x800", "ok": True, "message": "After custom width/height mode, fill both visible size inputs with Playwright."})
+        direct_configured: dict[str, Any] | None = None
         try:
-            page.locator(".ant-modal:visible .ant-select").nth(1).click(timeout=5000)
-            page.wait_for_timeout(500)
-            page.locator('.ant-select-dropdown:visible .ant-select-item-option[title="自定义宽高"]').last.click(timeout=5000)
-            page.wait_for_timeout(900)
-            python_selects.append({"target": "自定义宽高", "ok": True})
-        except Exception as exc:
-            python_selects.append({"target": "自定义宽高", "ok": False, "message": str(exc)})
-        configured = page.evaluate(
+            modal = page.locator(".ant-modal").last
+            inputs = modal.locator('input[type="text"]')
+            input_count = inputs.count()
+            filled_values: list[str] = []
+            for idx in range(input_count):
+                item = inputs.nth(idx)
+                try:
+                    if not item.is_visible(timeout=800):
+                        continue
+                    item.click(timeout=1500)
+                    item.fill("800", timeout=2500)
+                    filled_values.append(item.input_value(timeout=800))
+                except Exception:
+                    continue
+            button = page.locator("button").filter(has_text="生成JPG图片").last
+            button.click(timeout=6000)
+            page.wait_for_timeout(25000)
+            apply_after_generate = page.evaluate(
+                """() => {
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const clickLikeUser = (el) => {
+                        el.scrollIntoView({block: 'center', inline: 'nearest'});
+                        for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                            el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                        }
+                    };
+                    const modal = Array.from(document.querySelectorAll('.ant-modal')).filter(visible).pop();
+                    if (!modal) return {ok: false, reason: 'modal_not_found'};
+                    const buttons = Array.from(modal.querySelectorAll('button.ant-btn-primary, button, a')).filter(visible)
+                        .map((el) => ({el, text: textOf(el)}));
+                    const applyButton = buttons.find((item) => ['\\u786e\\u5b9a', '\\u4fdd\\u5b58', '\\u5e94\\u7528'].some((text) => item.text === text || item.text.includes(text)) && !item.text.includes('\\u751f\\u6210JPG\\u56fe\\u7247') && !item.text.includes('\\u751f\\u6210PNG\\u56fe\\u7247'));
+                    if (!applyButton) return {ok: false, reason: 'apply_button_not_found', buttons: buttons.map((item) => item.text).filter(Boolean).slice(0, 40)};
+                    clickLikeUser(applyButton.el);
+                    return {ok: true, clicked: applyButton.text};
+                }"""
+            )
+            if isinstance(apply_after_generate, dict) and apply_after_generate.get("ok"):
+                page.wait_for_timeout(2500)
+            image_sizes = page.evaluate(
+                """() => {
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const modal = Array.from(document.querySelectorAll('.ant-modal')).filter(visible).pop();
+                    return {
+                        imageSizes: modal ? Array.from(modal.querySelectorAll('img')).filter(visible).map((img) => ({
+                            width: img.naturalWidth,
+                            height: img.naturalHeight,
+                            text: textOf(img.parentElement || img)
+                        })).slice(0, 30) : [],
+                        buttons: modal ? Array.from(modal.querySelectorAll('button,a,span')).filter(visible).map((el) => textOf(el)).filter(Boolean).slice(0, 40) : []
+                    };
+                }"""
+            )
+            direct_configured = {
+                "ok": True,
+                "method": "playwright_native_fill_click",
+                "filled": filled_values,
+                "clicked": "生成JPG图片",
+                "applied": apply_after_generate,
+                **(image_sizes if isinstance(image_sizes, dict) else {}),
+            }
+            if not filled_values:
+                direct_configured = None
+                python_selects.append({"target": "playwright_native_fill_click", "ok": False, "message": "no visible size input filled; falling back to JS setValue"})
+        except Exception as direct_exc:
+            python_selects.append({"target": "playwright_native_fill_click", "ok": False, "message": str(direct_exc)})
+
+        if direct_configured is None:
+            try:
+                direct_configured = page.evaluate(
+                    """async (t) => {
+                        const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                        const clickLikeUser = (el) => {
+                            el.scrollIntoView({block: 'center', inline: 'nearest'});
+                            for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                                el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                            }
+                        };
+                        const setValue = (input, value) => {
+                            input.focus();
+                            const proto = Object.getPrototypeOf(input);
+                            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (desc && desc.set) desc.set.call(input, value);
+                            else input.value = value;
+                            input.dispatchEvent(new Event('input', {bubbles: true}));
+                            input.dispatchEvent(new Event('change', {bubbles: true}));
+                            input.dispatchEvent(new Event('blur', {bubbles: true}));
+                        };
+                        const roots = Array.from(document.querySelectorAll('.ant-modal, .ant-drawer, .el-dialog, .modal, [role="dialog"]')).filter(visible);
+                        const root = roots.find((el) => {
+                            const text = textOf(el);
+                            return text.includes(t.batch_a) || text.includes(t.batch_b) || (text.includes(t.change_to) && (text.includes(t.jpg_a) || text.includes(t.jpg_b)));
+                        });
+                        if (!root) return {ok: false, reason: 'batch_size_modal_not_found'};
+                        const chooseOption = async (selectIndex, optionText) => {
+                            const selects = Array.from(root.querySelectorAll('.ant-select')).filter(visible);
+                            const select = selects[selectIndex];
+                            if (!select) return {ok: false, reason: 'select_not_found', selectIndex};
+                            clickLikeUser(select);
+                            await sleep(350);
+                            const dropdowns = Array.from(document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden)')).filter(visible);
+                            const options = dropdowns.flatMap((dropdown) => Array.from(dropdown.querySelectorAll('.ant-select-item-option, [role="option"]')).filter(visible));
+                            const option = options.find((item) => textOf(item).includes(optionText));
+                            if (!option) return {ok: false, reason: 'option_not_found', optionText, options: options.map(textOf).filter(Boolean).slice(0, 20)};
+                            clickLikeUser(option);
+                            await sleep(450);
+                            return {ok: true, optionText};
+                        };
+                        const ratioResult = await chooseOption(0, t.custom_ratio);
+                        const sizeResult = await chooseOption(1, t.custom_size);
+                        const inputs = Array.from(root.querySelectorAll('input.ant-input, input')).filter(visible)
+                            .filter((input) => !['file', 'checkbox', 'radio', 'search'].includes(input.type));
+                        if (!inputs.length) return {ok: false, reason: 'input_not_found', ratioResult, sizeResult, rootText: textOf(root).slice(0, 500)};
+                        for (const input of inputs) setValue(input, '800');
+                        const buttons = Array.from(root.querySelectorAll('button.ant-btn-primary, button, a')).filter(visible)
+                            .map((el) => ({el, text: textOf(el), rect: el.getBoundingClientRect()}));
+                        const button = buttons.find((item) => item.text.includes(t.jpg_a) || item.text.includes(t.jpg_b));
+                        if (!button) return {ok: false, reason: 'jpg_button_not_found', ratioResult, sizeResult, filled: inputs.map((input) => input.value), buttons: buttons.map((item) => item.text).filter(Boolean).slice(0, 30)};
+                        clickLikeUser(button.el);
+                        await sleep(20000);
+                        const finalButtons = Array.from(root.querySelectorAll('button.ant-btn-primary, button, a')).filter(visible)
+                            .map((el) => ({el, text: textOf(el), rect: el.getBoundingClientRect()}));
+                        const applyButton = finalButtons.find((item) => ['\\u786e\\u5b9a', '\\u4fdd\\u5b58', '\\u5e94\\u7528'].some((text) => item.text === text || item.text.includes(text)) && !item.text.includes(t.jpg_a) && !item.text.includes(t.jpg_b));
+                        if (applyButton) {
+                            clickLikeUser(applyButton.el);
+                            await sleep(2500);
+                        }
+                        return {ok: true, method: 'js_custom_width_height_800', ratioResult, sizeResult, filled: inputs.map((input) => input.value), clicked: button.text, applied: applyButton ? applyButton.text : ''};
+                    }""",
+                    texts,
+                )
+                python_selects.append({"target": "js_custom_width_height_800", "ok": bool(isinstance(direct_configured, dict) and direct_configured.get("ok")), "message": str(direct_configured)[:500]})
+            except Exception as js_direct_exc:
+                python_selects.append({"target": "js_custom_width_height_800", "ok": False, "message": str(js_direct_exc)})
+
+        configured = direct_configured if direct_configured is not None else page.evaluate(
             """async (t) => {
                 const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
                 const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
@@ -2369,29 +2584,12 @@ def _set_selected_images_square_800(page: Any, stage: str = "", logger: Any | No
                         el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
                     }
                 };
-                const selectOption = async (select, targetText) => {
-                    if (!select || !targetText) return {ok: false, reason: 'missing_select_or_target'};
-                    clickLikeUser(select);
-                    await sleep(600);
-                    const options = Array.from(document.querySelectorAll('.ant-select-dropdown .ant-select-item-option')).filter(visible)
-                        .map((el) => ({el, text: textOf(el), title: el.getAttribute('title') || ''}));
-                    const option = options.find((item) => item.text.includes(targetText) || item.title === targetText);
-                    if (!option) return {ok: false, reason: 'option_not_found', target: targetText, options: options.map((item) => item.text || item.title).slice(0, 20)};
-                    clickLikeUser(option.el);
-                    await sleep(800);
-                    return {ok: true, target: targetText};
-                };
                 const roots = Array.from(document.querySelectorAll('.ant-modal, .ant-drawer, .el-dialog, .modal, [role="dialog"]')).filter(visible);
                 const root = roots.find((el) => textOf(el).includes(t.change_to) && (textOf(el).includes(t.jpg_a) || textOf(el).includes(t.jpg_b)));
                 if (!root) return {ok: false, reason: 'batch_size_modal_not_found'};
-                const selects = Array.from(root.querySelectorAll('.ant-select')).filter(visible);
-                const ratioSelect = selects[0] || null;
-                const ratioResult = await selectOption(ratioSelect, t.custom_ratio);
-                const refreshedRoot = Array.from(document.querySelectorAll('.ant-modal, .ant-drawer, .el-dialog, .modal, [role="dialog"]')).filter(visible)
-                    .find((el) => textOf(el).includes(t.change_to) && (textOf(el).includes(t.jpg_a) || textOf(el).includes(t.jpg_b))) || root;
-                const refreshedSelects = Array.from(refreshedRoot.querySelectorAll('.ant-select')).filter(visible);
-                const sizeSelect = refreshedSelects[1] || null;
-                const sizeResult = await selectOption(sizeSelect, t.custom_size);
+                const ratioResult = {ok: true, skipped: true};
+                const sizeResult = {ok: true, skipped: true};
+                const refreshedRoot = root;
                 const inputs = Array.from(refreshedRoot.querySelectorAll('input.ant-input, input')).filter(visible)
                     .filter((input) => !['file', 'checkbox', 'radio', 'search'].includes(input.type));
                 if (!inputs.length) return {ok: false, reason: 'input_not_found', inputCount: inputs.length, rootText: textOf(refreshedRoot).slice(0, 500), ratioResult, sizeResult};
@@ -2401,13 +2599,20 @@ def _set_selected_images_square_800(page: Any, stage: str = "", logger: Any | No
                 const button = buttons.find((item) => item.text.includes(t.jpg_a) || item.text.includes(t.jpg_b));
                 if (!button) return {ok: false, reason: 'jpg_button_not_found', filled: inputs.map((input) => input.value), buttons: buttons.map((item) => item.text).filter(Boolean).slice(0, 30), rootText: textOf(refreshedRoot).slice(0, 800), ratioResult, sizeResult};
                 clickLikeUser(button.el);
-                await sleep(9000);
+                await sleep(20000);
                 const finalModal = Array.from(document.querySelectorAll('.ant-modal')).filter(visible)
                     .find((el) => textOf(el).includes(t.jpg_a) || textOf(el).includes(t.jpg_b)) || refreshedRoot;
+                const finalButtons = Array.from(finalModal.querySelectorAll('button.ant-btn-primary, button, a')).filter(visible)
+                    .map((el) => ({el, text: textOf(el), cls: String(el.className || ''), rect: el.getBoundingClientRect()}));
+                const applyButton = finalButtons.find((item) => ['确定', '保存', '应用'].some((text) => item.text === text || item.text.includes(text)) && !item.text.includes(t.jpg_a) && !item.text.includes(t.jpg_b));
+                if (applyButton) {
+                    clickLikeUser(applyButton.el);
+                    await sleep(3000);
+                }
                 const imageSizes = Array.from(finalModal.querySelectorAll('img')).filter(visible)
                     .map((img) => ({width: img.naturalWidth, height: img.naturalHeight, text: textOf(img.parentElement || img)}))
                     .slice(0, 30);
-                return {ok: true, filled: inputs.map((input) => input.value), clicked: button.text, x: button.rect.x, y: button.rect.y, ratioResult, sizeResult, imageSizes};
+                return {ok: true, filled: inputs.map((input) => input.value), clicked: button.text, x: button.rect.x, y: button.rect.y, ratioResult, sizeResult, applied: applyButton ? applyButton.text : '', buttons: finalButtons.map((item) => item.text).filter(Boolean).slice(0, 30), imageSizes};
             }""",
             texts,
         )
@@ -2448,128 +2653,795 @@ def _set_selected_images_square_800(page: Any, stage: str = "", logger: Any | No
             page.wait_for_timeout(800)
         status = "ok" if isinstance(configured, dict) and configured.get("ok") else "skipped"
         result = {"status": status, "stage": stage, "button": clicked, "batch": batch_clicked, "python_selects": python_selects, "configured": configured, "modal_close": close_result}
+        if status == "ok" and not _product_carousel_has_square_images(page):
+            local_fallback = _replace_product_carousel_with_local_square_images(page, stage=stage, logger=logger)
+            result["local_square_upload_fallback"] = local_fallback
+            if local_fallback.get("status") == "ok":
+                status = "ok"
+                result["status"] = "ok"
+            elif local_fallback.get("status") == "failed":
+                result["status"] = "failed"
         _log(logger, "image_edit_800", status, f"{stage} image 1:1/800 edit result: {result}", page=page)
         return result
     except Exception as exc:
         return {"status": "failed", "stage": stage, "message": str(exc)}
 
 
-def _ensure_variant_preview_images_square_800(page: Any, stage: str = "", logger: Any | None = None) -> dict[str, Any]:
-    """Replace SKU/variant preview images with generated 800x800 carousel images."""
+def _product_carousel_has_square_images(page: Any) -> bool:
     try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const header = Array.from(document.querySelectorAll('body *')).filter(visible)
+                        .find((el) => textOf(el).includes('\\u4ea7\\u54c1\\u8f6e\\u64ad\\u56fe') && textOf(el).length < 120);
+                    const headerY = header ? header.getBoundingClientRect().y : 0;
+                    const next = Array.from(document.querySelectorAll('body *')).filter(visible)
+                        .find((el) => el.getBoundingClientRect().y > headerY + 80 && /\\u4ea7\\u54c1\\u7d20\\u6750\\u56fe|\\u4ea7\\u54c1\\u89c6\\u9891|\\u53d8\\u79cd\\u5c5e\\u6027/.test(textOf(el)));
+                    const nextY = next ? next.getBoundingClientRect().y : Number.MAX_SAFE_INTEGER;
+                    const imgs = Array.from(document.querySelectorAll('img')).filter(visible).filter((img) => {
+                        if (img.closest('.ant-modal,.ant-dropdown,.ant-popover')) return false;
+                        const r = img.getBoundingClientRect();
+                        const text = textOf(img.parentElement || img);
+                        return r.y >= headerY && r.y <= nextY && /\\u70b9\\u51fb\\u53d6\\u6d88|\\u9009\\u7528/.test(text);
+                    });
+                    if (!imgs.length) return false;
+                    return imgs.slice(0, 10).every((img) => {
+                        const text = textOf(img.parentElement || img);
+                        const naturalOk = img.naturalWidth >= 800 && img.naturalHeight >= 800 && Math.abs(img.naturalWidth - img.naturalHeight) <= 2;
+                        return naturalOk || /800\\s*[xX\\u00d7\\*]\\s*800/.test(text);
+                    });
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _replace_product_carousel_with_local_square_images(page: Any, stage: str = "", logger: Any | None = None) -> dict[str, Any]:
+    """Fallback for Dianxiaomi's batch editor: create 800x800 local copies and upload them to the carousel."""
+    try:
+        import tempfile
+        import urllib.request
+        from io import BytesIO
+        from pathlib import Path
+
+        from PIL import Image, ImageOps
+
+        sources = page.evaluate(
+            """() => {
+                const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const header = Array.from(document.querySelectorAll('body *')).filter(visible)
+                    .find((el) => textOf(el).includes('\\u4ea7\\u54c1\\u8f6e\\u64ad\\u56fe') && textOf(el).length < 120);
+                const headerY = header ? header.getBoundingClientRect().y : 0;
+                const next = Array.from(document.querySelectorAll('body *')).filter(visible)
+                    .find((el) => el.getBoundingClientRect().y > headerY + 80 && /\\u4ea7\\u54c1\\u7d20\\u6750\\u56fe|\\u4ea7\\u54c1\\u89c6\\u9891|\\u53d8\\u79cd\\u5c5e\\u6027/.test(textOf(el)));
+                const nextY = next ? next.getBoundingClientRect().y : Number.MAX_SAFE_INTEGER;
+                const imgs = Array.from(document.querySelectorAll('img')).filter(visible).filter((img) => {
+                    if (img.closest('.ant-modal,.ant-dropdown,.ant-popover')) return false;
+                    const r = img.getBoundingClientRect();
+                    const src = img.currentSrc || img.src || '';
+                    if (!src || src.startsWith('data:') || src.includes('loading')) return false;
+                    return r.y >= headerY && r.y <= nextY && r.width >= 40 && r.height >= 40;
+                });
+                const seen = new Set();
+                const out = [];
+                for (const img of imgs) {
+                    const src = img.currentSrc || img.src || '';
+                    if (seen.has(src)) continue;
+                    seen.add(src);
+                    out.push(src);
+                    if (out.length >= 10) break;
+                }
+                return out;
+            }"""
+        )
+        if not isinstance(sources, list) or not sources:
+            return {"status": "skipped", "message": "no carousel image sources"}
+        work_dir = Path(tempfile.gettempdir()) / "dxm_product_carousel_square"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        local_files: list[str] = []
+        for idx, src in enumerate(sources[:10], start=1):
+            request = urllib.request.Request(str(src), headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=25) as response:
+                data = response.read()
+            image = Image.open(BytesIO(data)).convert("RGB")
+            square = ImageOps.fit(image, (800, 800), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+            target = work_dir / f"{stage or 'carousel'}_{idx:02d}.jpg"
+            square.save(target, "JPEG", quality=92, optimize=True)
+            local_files.append(str(target))
+        if not local_files:
+            return {"status": "skipped", "message": "no local square files generated"}
+
+        unselect = page.evaluate(
+            """() => {
+                const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const clickLikeUser = (el) => {
+                    el.scrollIntoView({block: 'center', inline: 'nearest'});
+                    for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                        el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                    }
+                };
+                const header = Array.from(document.querySelectorAll('body *')).filter(visible)
+                    .find((el) => textOf(el).includes('\\u4ea7\\u54c1\\u8f6e\\u64ad\\u56fe') && textOf(el).length < 120);
+                const headerY = header ? header.getBoundingClientRect().y : 0;
+                const next = Array.from(document.querySelectorAll('body *')).filter(visible)
+                    .find((el) => el.getBoundingClientRect().y > headerY + 80 && /\\u4ea7\\u54c1\\u7d20\\u6750\\u56fe|\\u4ea7\\u54c1\\u89c6\\u9891|\\u53d8\\u79cd\\u5c5e\\u6027/.test(textOf(el)));
+                const nextY = next ? next.getBoundingClientRect().y : Number.MAX_SAFE_INTEGER;
+                const selectedByClass = Array.from(document.querySelectorAll('label.ant-checkbox-wrapper-checked.image-checkbox, .image-checkbox.ant-checkbox-wrapper-checked')).filter(visible).filter((el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.y >= headerY && r.y <= nextY && r.width >= 40 && r.height >= 40;
+                });
+                const selectedByText = Array.from(document.querySelectorAll('body *')).filter(visible).filter((el) => {
+                    const r = el.getBoundingClientRect();
+                    const text = textOf(el);
+                    return r.y >= headerY && r.y <= nextY && text.includes('\\u70b9\\u51fb\\u53d6\\u6d88') && r.width >= 40 && r.height >= 40;
+                });
+                const selected = selectedByClass.length ? selectedByClass : selectedByText;
+                let clicked = 0;
+                for (const item of selected.slice(0, 12)) {
+                    clickLikeUser(item);
+                    clicked += 1;
+                }
+                return {clicked, method: selectedByClass.length ? 'checked_class' : 'cancel_text'};
+            }"""
+        )
+        page.wait_for_timeout(800)
+        opened = page.evaluate(
+            """() => {
+                const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const clickLikeUser = (el) => {
+                    el.scrollIntoView({block: 'center', inline: 'nearest'});
+                    for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                        el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                    }
+                };
+                const header = Array.from(document.querySelectorAll('body *')).filter(visible)
+                    .find((el) => textOf(el).includes('\\u4ea7\\u54c1\\u8f6e\\u64ad\\u56fe') && textOf(el).length < 120);
+                if (header) {
+                    header.scrollIntoView({block: 'center', inline: 'nearest'});
+                    window.scrollBy(0, -80);
+                }
+                const button = Array.from(document.querySelectorAll('button,a,span')).filter(visible)
+                    .find((el) => textOf(el) === '\\u9009\\u62e9\\u56fe\\u7247');
+                if (!button) return {ok: false, reason: 'select_image_button_not_found'};
+                clickLikeUser(button);
+                return {ok: true};
+            }"""
+        )
+        page.wait_for_timeout(500)
+        menu_clicked = page.evaluate(
+            """() => {
+                const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const clickLikeUser = (el) => {
+                    el.scrollIntoView({block: 'center', inline: 'nearest'});
+                    for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                        el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                    }
+                };
+                const item = Array.from(document.querySelectorAll('.ant-dropdown-menu-item,.ant-dropdown-menu-title-content,[role="menuitem"],li')).filter(visible)
+                    .find((el) => textOf(el).includes('\\u672c\\u5730\\u56fe\\u7247'));
+                if (!item) return {ok: false, reason: 'local_image_menu_not_found'};
+                clickLikeUser(item);
+                return {ok: true};
+            }"""
+        )
+        page.wait_for_timeout(500)
+        upload_results: list[dict[str, Any]] = []
+        for file_index, file_path in enumerate(local_files, start=1):
+            if file_index > 1:
+                page.evaluate(
+                    """() => {
+                        const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        const clickLikeUser = (el) => {
+                            el.scrollIntoView({block: 'center', inline: 'nearest'});
+                            for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                                el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                            }
+                        };
+                        const button = Array.from(document.querySelectorAll('button,a,span')).filter(visible)
+                            .find((el) => textOf(el) === '\\u9009\\u62e9\\u56fe\\u7247');
+                        if (button) clickLikeUser(button);
+                    }"""
+                )
+                page.wait_for_timeout(250)
+                page.evaluate(
+                    """() => {
+                        const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        const clickLikeUser = (el) => {
+                            el.scrollIntoView({block: 'center', inline: 'nearest'});
+                            for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                                el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                            }
+                        };
+                        const item = Array.from(document.querySelectorAll('.ant-dropdown-menu-item,.ant-dropdown-menu-title-content,[role="menuitem"],li')).filter(visible)
+                            .find((el) => textOf(el).includes('\\u672c\\u5730\\u56fe\\u7247'));
+                        if (item) clickLikeUser(item);
+                    }"""
+                )
+                page.wait_for_timeout(250)
+            file_input = page.locator("#localFileUploadInp").first
+            file_input.set_input_files(file_path, timeout=10000)
+            page.wait_for_timeout(2500)
+            upload_results.append({"index": file_index, "path": file_path})
+        page.wait_for_timeout(5000)
+        select_uploaded = page.evaluate(
+            """() => {
+                const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const clickLikeUser = (el) => {
+                    el.scrollIntoView({block: 'center', inline: 'nearest'});
+                    for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                        el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                    }
+                };
+                const header = Array.from(document.querySelectorAll('body *')).filter(visible)
+                    .find((el) => textOf(el).includes('\\u4ea7\\u54c1\\u8f6e\\u64ad\\u56fe') && textOf(el).length < 120);
+                const headerY = header ? header.getBoundingClientRect().y : 0;
+                const next = Array.from(document.querySelectorAll('body *')).filter(visible)
+                    .find((el) => el.getBoundingClientRect().y > headerY + 80 && /\\u4ea7\\u54c1\\u7d20\\u6750\\u56fe|\\u4ea7\\u54c1\\u89c6\\u9891|\\u53d8\\u79cd\\u5c5e\\u6027/.test(textOf(el)));
+                const nextY = next ? next.getBoundingClientRect().y : Number.MAX_SAFE_INTEGER;
+                const labels = Array.from(document.querySelectorAll('label.image-checkbox, .image-checkbox')).filter(visible).filter((label) => {
+                    const r = label.getBoundingClientRect();
+                    const text = textOf(label);
+                    const alreadyChecked = String(label.className || '').includes('ant-checkbox-wrapper-checked') || !!label.querySelector('.ant-checkbox-checked');
+                    return r.y >= headerY && r.y <= nextY && !alreadyChecked && /800\\s*[xX\\u00d7\\*]\\s*800/.test(text);
+                });
+                let clicked = 0;
+                for (const label of labels.slice(0, 10)) {
+                    clickLikeUser(label);
+                    clicked += 1;
+                }
+                return {clicked, candidates: labels.length};
+            }"""
+        )
+        if isinstance(select_uploaded, dict) and select_uploaded.get("clicked"):
+            page.wait_for_timeout(1200)
+        state = page.evaluate(
+            """() => {
+                const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const header = Array.from(document.querySelectorAll('body *')).filter(visible)
+                    .find((el) => textOf(el).includes('\\u4ea7\\u54c1\\u8f6e\\u64ad\\u56fe') && textOf(el).length < 120);
+                const pageText = document.body.innerText || '';
+                const selectedTextMatch = pageText.match(/\\u5df2\\u7ecf\\u9009\\u7528\\u4e86\\s*(\\d+)\\s*\\u5f20/);
+                return {
+                    selected_text_count: selectedTextMatch ? Number(selectedTextMatch[1]) : null,
+                    has_800_text: /800\\s*[xX\\u00d7\\*]\\s*800/.test(pageText),
+                    sample_text: pageText.slice(0, 1500)
+                };
+            }"""
+        )
+        status = "ok" if state.get("has_800_text") or (state.get("selected_text_count") and state.get("selected_text_count") >= min(5, len(local_files))) else "failed"
+        result = {"status": status, "method": "local_square_upload", "files": local_files, "uploads": upload_results, "source_count": len(sources), "unselect": unselect, "opened": opened, "menu_clicked": menu_clicked, "select_uploaded": select_uploaded, "state": state}
+        _log(logger, "product_carousel_local_square_upload", status, f"{stage} local square upload fallback: {result}", page=page)
+        return result
+    except Exception as exc:
+        result = {"status": "failed", "method": "local_square_upload", "message": str(exc)}
+        _log(logger, "product_carousel_local_square_upload", "failed", f"{stage} local square upload fallback failed: {exc}", page=page)
+        return result
+
+
+def _ensure_variant_preview_images_square_800(
+    page: Any,
+    stage: str = "",
+    logger: Any | None = None,
+    add_missing: bool = True,
+) -> dict[str, Any]:
+    """Keep existing SKU preview images and only resize them to 1:1; fill empty previews from gallery."""
+    try:
+        def scroll_to_variant_preview_section() -> dict[str, Any]:
+            try:
+                result = page.evaluate(
+                    """() => {
+                        const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        const clickLikeUser = (el) => {
+                            el.scrollIntoView({block: 'center', inline: 'nearest'});
+                            for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                                el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                            }
+                        };
+                        const nav = Array.from(document.querySelectorAll('a, button, .ant-anchor-link-title, .ant-tabs-tab, span, div')).filter(visible)
+                            .map((el) => ({el, text: textOf(el)}))
+                            .find((item) => item.text === '\\u53d8\\u79cd\\u4fe1\\u606f' || item.text === '\\u53d8\\u79cd\\u5c5e\\u6027');
+                        if (nav) {
+                            clickLikeUser(nav.el);
+                        }
+                        const all = Array.from(document.querySelectorAll('th, .vxe-header--column, .ant-table-cell, div, span, h1, h2, h3, h4, label')).filter(visible)
+                            .map((el) => ({el, text: textOf(el), rect: el.getBoundingClientRect()}));
+                        const header = all.find((item) => /\\u9884\\u89c8\\u56fe/.test(item.text) && /\\u6279\\u91cf/.test(item.text))
+                            || all.find((item) => item.text === '\\u53d8\\u79cd\\u4fe1\\u606f')
+                            || all.find((item) => /\\u53d8\\u79cd\\u4fe1\\u606f/.test(item.text));
+                        if (header) {
+                            header.el.scrollIntoView({block: 'center', inline: 'nearest'});
+                            return {ok: true, targetText: header.text, y: header.rect.y};
+                        }
+                        const box = Array.from(document.querySelectorAll('.sku-image-box')).filter(visible)[0];
+                        if (box) {
+                            box.scrollIntoView({block: 'center', inline: 'nearest'});
+                            return {ok: true, targetText: 'sku-image-box'};
+                        }
+                        return {ok: false, reason: 'variant_section_not_found', texts: all.map((item) => item.text).filter(Boolean).slice(0, 80)};
+                    }"""
+                )
+                page.wait_for_timeout(600)
+                return result if isinstance(result, dict) else {"ok": False, "reason": "unknown_scroll_result"}
+            except Exception as exc:
+                return {"ok": False, "reason": str(exc)}
+
+        scroll_result = scroll_to_variant_preview_section()
+        _log(logger, "variant_preview_scroll", "ok" if scroll_result.get("ok") else "warning", f"{stage} variant preview scroll: {scroll_result}", page=page, extra=scroll_result)
+
         def read_state() -> list[dict[str, Any]]:
             value = page.evaluate(
                 """() => {
-                    const visible = (el) => !!el && el.offsetParent !== null && getComputedStyle(el).visibility !== 'hidden';
-                    return Array.from(document.querySelectorAll('.sku-image-box img')).filter(visible).map((img, index) => ({
-                        index,
-                        src: img.currentSrc || img.src || '',
-                        width: img.naturalWidth || 0,
-                        height: img.naturalHeight || 0,
-                    }));
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const boxes = Array.from(document.querySelectorAll('.sku-image-box')).filter(visible);
+                    return boxes.map((box, index) => {
+                        const img = box.querySelector('img');
+                        const src = img ? (img.currentSrc || img.src || '') : '';
+                        const hasImage = !!(src && !/placeholder|default|empty|loading/i.test(src));
+                        return {
+                            index,
+                            has_image: hasImage,
+                            src,
+                            width: img ? (img.naturalWidth || 0) : 0,
+                            height: img ? (img.naturalHeight || 0) : 0,
+                            text: (box.innerText || box.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120),
+                        };
+                    });
                 }"""
             )
             return value if isinstance(value, list) else []
 
-        before = read_state()
-        bad_indices = [
-            int(item.get("index", 0))
-            for item in before
-            if item.get("src") and (int(item.get("width") or 0) != int(item.get("height") or 0) or int(item.get("width") or 0) < 800 or int(item.get("height") or 0) < 800)
-        ]
-        actions: list[dict[str, Any]] = []
-        if not bad_indices:
-            result = {"status": "ok", "stage": stage, "before": before, "after": before, "actions": actions, "message": "variant preview images already square"}
-            _log(logger, "variant_preview_image_800", "ok", f"{stage} variant preview images already square.", page=page, extra=result)
-            return result
+        def click_box(index: int) -> dict[str, Any]:
+            try:
+                box = page.locator(".sku-image-box:visible").nth(index)
+                box.scroll_into_view_if_needed(timeout=2000)
+                box.click(timeout=3000, force=True)
+                page.wait_for_timeout(300)
+                return {"ok": True}
+            except Exception as exc:
+                return {"ok": False, "message": str(exc)}
 
-        for index in bad_indices[:20]:
+        def configure_open_image_editor() -> dict[str, Any]:
+            texts = {
+                "change_to": "\u53d8\u5316\u81f3",
+                "jpg_a": "\u751f\u6210JPG\u56fe\u7247",
+                "jpg_b": "\u751f\u6210jpg\u56fe\u7247",
+                "custom_ratio": "\u81ea\u5b9a\u4e49\u6bd4\u4f8b",
+                "custom_size": "\u81ea\u5b9a\u4e49\u5c3a\u5bf8",
+                "confirm_a": "\u786e\u5b9a",
+                "save_a": "\u4fdd\u5b58",
+            }
+            configured = page.evaluate(
+                """async (t) => {
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                    const setValue = (input, value) => {
+                        input.focus();
+                        const proto = Object.getPrototypeOf(input);
+                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                        if (desc && desc.set) desc.set.call(input, value);
+                        else input.value = value;
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                        input.dispatchEvent(new Event('blur', {bubbles: true}));
+                    };
+                    const clickLikeUser = (el) => {
+                        el.scrollIntoView({block: 'center', inline: 'nearest'});
+                        for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
+                            el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                        }
+                    };
+                    const selectOption = async (select, targetText) => {
+                        if (!select || !targetText) return {ok: false, reason: 'missing_select_or_target'};
+                        clickLikeUser(select);
+                        await sleep(500);
+                        const options = Array.from(document.querySelectorAll('.ant-select-dropdown .ant-select-item-option')).filter(visible)
+                            .map((el) => ({el, text: textOf(el), title: el.getAttribute('title') || ''}));
+                        const option = options.find((item) => item.text.includes(targetText) || item.title.includes(targetText));
+                        if (!option) return {ok: false, reason: 'option_not_found', target: targetText, options: options.map((item) => item.text || item.title).slice(0, 20)};
+                        clickLikeUser(option.el);
+                        await sleep(600);
+                        return {ok: true, target: targetText};
+                    };
+                    const roots = Array.from(document.querySelectorAll('.ant-modal, .ant-drawer, .el-dialog, .modal, [role="dialog"]')).filter(visible);
+                    const root = roots.reverse().find((el) => {
+                        const text = textOf(el);
+                        return (text.includes(t.change_to) || text.includes('800') || text.includes(t.jpg_a) || text.includes(t.jpg_b))
+                            && (text.includes(t.jpg_a) || text.includes(t.jpg_b) || text.includes('JPG'));
+                    });
+                    if (!root) return {ok: false, reason: 'image_edit_modal_not_found'};
+                    let selects = Array.from(root.querySelectorAll('.ant-select')).filter(visible);
+                    const ratioResult = await selectOption(selects[0] || null, t.custom_ratio);
+                    const refreshedRoots = Array.from(document.querySelectorAll('.ant-modal, .ant-drawer, .el-dialog, .modal, [role="dialog"]')).filter(visible);
+                    const refreshedRoot = refreshedRoots.reverse().find((el) => {
+                        const text = textOf(el);
+                        return text.includes(t.change_to) || text.includes(t.jpg_a) || text.includes(t.jpg_b) || text.includes('JPG');
+                    }) || root;
+                    selects = Array.from(refreshedRoot.querySelectorAll('.ant-select')).filter(visible);
+                    const sizeResult = await selectOption(selects[1] || selects[0] || null, t.custom_size);
+                    const inputs = Array.from(refreshedRoot.querySelectorAll('input.ant-input, input')).filter(visible)
+                        .filter((input) => !['file', 'checkbox', 'radio', 'search'].includes(input.type));
+                    for (const input of inputs) setValue(input, '800');
+                    const buttons = Array.from(refreshedRoot.querySelectorAll('button.ant-btn-primary, button, a')).filter(visible)
+                        .map((el) => ({el, text: textOf(el)}));
+                    const button = buttons.find((item) => item.text.includes(t.jpg_a) || item.text.includes(t.jpg_b))
+                        || buttons.find((item) => item.text.includes(t.confirm_a) || item.text.includes(t.save_a));
+                    if (!button) return {ok: false, reason: 'generate_button_not_found', filled: inputs.map((input) => input.value), buttons: buttons.map((item) => item.text).filter(Boolean).slice(0, 30), ratioResult, sizeResult, rootText: textOf(refreshedRoot).slice(0, 800)};
+                    clickLikeUser(button.el);
+                    await sleep(9000);
+                    const finalModal = Array.from(document.querySelectorAll('.ant-modal, .ant-drawer, .el-dialog, .modal, [role="dialog"]')).filter(visible).reverse()[0] || refreshedRoot;
+                    const imageSizes = Array.from(finalModal.querySelectorAll('img')).filter(visible)
+                        .map((img) => ({width: img.naturalWidth, height: img.naturalHeight, src: img.src, text: textOf(img.parentElement || img)})).slice(0, 30);
+                    return {ok: true, filled: inputs.map((input) => input.value), clicked: button.text, ratioResult, sizeResult, imageSizes};
+                }""",
+                texts,
+            )
             try:
                 page.keyboard.press("Escape")
             except Exception:
                 pass
-            try:
-                box = page.locator(".sku-image-box.ant-dropdown-trigger").nth(index)
-                box.scroll_into_view_if_needed(timeout=3000)
-                box.click(timeout=5000, force=True)
-                page.wait_for_timeout(500)
-            except Exception as exc:
-                actions.append({"index": index, "status": "failed", "step": "open_dropdown", "message": str(exc)})
-                continue
+            page.wait_for_timeout(800)
+            return configured if isinstance(configured, dict) else {"ok": False, "reason": "unknown_editor_result"}
 
-            menu_result = page.evaluate(
-                """() => {
-                    const visible = (el) => !!el && el.offsetParent !== null && getComputedStyle(el).visibility !== 'hidden';
-                    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
-                    const target = '\\u5f15\\u7528\\u4ea7\\u54c1\\u8f6e\\u64ad\\u56fe';
-                    const items = Array.from(document.querySelectorAll('.ant-dropdown-menu-item, .ant-dropdown-menu-title-content, li, span, div')).filter(visible);
-                    const el = items.find((item) => textOf(item) === target) || items.find((item) => textOf(item).includes(target));
-                    if (!el) return {ok: false, reason: 'reference_carousel_item_not_found', texts: items.map(textOf).filter(Boolean).slice(0, 80)};
+        def click_dropdown_text(pattern: str) -> dict[str, Any]:
+            return page.evaluate(
+                """(patternText) => {
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const parts = String(patternText || '').split('|').map((item) => item.trim()).filter(Boolean);
+                    const containers = Array.from(document.querySelectorAll('.ant-dropdown, .ant-dropdown-menu, .el-dropdown-menu, [role="menu"], .dropdown-menu')).filter(visible);
+                    const items = containers.flatMap((container) => Array.from(container.querySelectorAll('.ant-dropdown-menu-item, .ant-dropdown-menu-title-content, li, span, a, div')).filter(visible));
+                    const el = items.find((item) => parts.some((part) => textOf(item).includes(part)));
+                    if (!el) return {ok: false, reason: 'menu_item_not_found', pattern: patternText, texts: items.map(textOf).filter(Boolean).slice(0, 80)};
+                    const target = el.closest('li, a, button, [role="menuitem"]') || el;
+                    target.scrollIntoView({block: 'center', inline: 'nearest'});
                     for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
-                        el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                        target.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
                     }
-                    return {ok: true, text: textOf(el)};
+                    return {ok: true, text: textOf(el), targetText: textOf(target)};
+                }""",
+                pattern,
+            )
+
+        def open_variant_preview_batch_menu() -> dict[str, Any]:
+            return page.evaluate(
+                """() => {
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const clickLikeUser = (el) => {
+                        el.scrollIntoView({block: 'center', inline: 'nearest'});
+                        for (const type of ['pointerover', 'mouseover', 'mouseenter', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                            el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                        }
+                    };
+                    const all = Array.from(document.querySelectorAll('th, .vxe-header--column, .ant-table-cell, div, span, a, button')).filter(visible)
+                        .map((el) => ({el, text: textOf(el), rect: el.getBoundingClientRect()}))
+                        .filter((item) => item.text && item.rect.y > 80);
+                    const headers = all.filter((item) => /预览图/.test(item.text) && /批量/.test(item.text) && item.el.matches('th, .vxe-header--column, .ant-table-cell, div'));
+                    let header = headers.sort((a, b) => a.text.length - b.text.length)[0];
+                    if (!header) {
+                        const preview = all.find((item) => item.text === '预览图' || /^预览图/.test(item.text));
+                        if (preview) header = preview;
+                    }
+                    if (!header) return {ok: false, reason: 'variant_preview_batch_header_not_found', texts: all.map((item) => item.text).slice(0, 120)};
+                    const headerRoot = header.el.closest('th, .vxe-header--column, .ant-table-cell') || header.el;
+                    const localCandidates = Array.from(headerRoot.querySelectorAll('.ant-dropdown-trigger, .img-options-action-btn, a, button, span, div')).filter(visible)
+                        .map((el) => ({el, text: textOf(el), rect: el.getBoundingClientRect(), cls: String(el.className || '')}))
+                        .filter((item) => item.text && /批量/.test(item.text));
+                    let target = localCandidates.find((item) => /ant-dropdown-trigger|img-options-action-btn/.test(item.cls))
+                        || localCandidates.find((item) => item.el.tagName === 'A' || item.el.tagName === 'BUTTON')
+                        || localCandidates.sort((a, b) => a.text.length - b.text.length)[0];
+                    if (!target) {
+                        const py = header.rect.y + header.rect.height / 2;
+                        target = all
+                            .filter((item) => /批量/.test(item.text) && Math.abs((item.rect.y + item.rect.height / 2) - py) < 45)
+                            .sort((a, b) => {
+                                const aScore = (/ant-dropdown-trigger|img-options-action-btn/.test(String(a.el.className || '')) ? 0 : 100) + a.text.length;
+                                const bScore = (/ant-dropdown-trigger|img-options-action-btn/.test(String(b.el.className || '')) ? 0 : 100) + b.text.length;
+                                return aScore - bScore;
+                            })[0];
+                    }
+                    if (!target) return {ok: false, reason: 'variant_preview_batch_trigger_not_found', header: header.text, texts: all.map((item) => item.text).slice(0, 120)};
+                    clickLikeUser(target.el);
+                    return {ok: true, text: target.text, tag: target.el.tagName, className: String(target.el.className || ''), x: target.rect.x, y: target.rect.y};
                 }"""
             )
-            if not isinstance(menu_result, dict) or not menu_result.get("ok"):
-                actions.append({"index": index, "status": "failed", "step": "reference_carousel", "result": menu_result})
-                continue
 
-            page.wait_for_timeout(900)
-            choose_result = page.evaluate(
+        def add_missing_from_gallery(index: int) -> dict[str, Any]:
+            opened = click_box(index)
+            if not opened.get("ok"):
+                return {"index": index, "status": "failed", "step": "open_empty_dropdown", "result": opened}
+            menu = click_dropdown_text("引用产品轮播图|引用产品图片|引用图片|选择图片")
+            if not isinstance(menu, dict) or not menu.get("ok"):
+                return {"index": index, "status": "failed", "step": "open_gallery_reference", "result": menu}
+            page.wait_for_timeout(600)
+            choose = page.evaluate(
                 """() => {
-                    const visible = (el) => !!el && el.offsetParent !== null && getComputedStyle(el).visibility !== 'hidden';
-                    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
-                    const modalTitle = '\\u5f15\\u7528\\u4ea7\\u54c1\\u56fe\\u7247';
-                    const chooseImage = '\\u9009\\u62e9\\u56fe\\u7247';
-                    const choose = '\\u9009\\u62e9';
-                    const modal = Array.from(document.querySelectorAll('.ant-modal')).filter((el) => visible(el) && textOf(el).includes(modalTitle)).pop();
-                    if (!modal) return {ok: false, reason: 'reference_image_modal_not_found'};
-                    const labels = Array.from(modal.querySelectorAll('label.ant-checkbox-wrapper')).filter(visible)
-                        .filter((label) => textOf(label).includes(chooseImage))
+                    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const modal = Array.from(document.querySelectorAll('.ant-modal')).filter(visible).pop();
+                    if (!modal) return {ok: false, reason: 'reference_modal_not_found'};
+                    const labels = Array.from(modal.querySelectorAll('label.ant-checkbox-wrapper, label, li, div')).filter(visible)
                         .map((label, idx) => {
                             const img = label.querySelector('img');
                             return {label, idx, src: img ? (img.currentSrc || img.src || '') : '', width: img ? (img.naturalWidth || 0) : 0, height: img ? (img.naturalHeight || 0) : 0};
-                        });
-                    const target = labels.find((item) => item.width === item.height && item.width >= 800) || labels[0];
+                        }).filter((item) => item.src);
+                    const target = labels.find((item) => item.width === item.height && item.width >= 700) || labels[0];
                     if (!target) return {ok: false, reason: 'no_reference_images'};
-                    target.label.scrollIntoView({block: 'center', inline: 'center'});
-                    for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) {
-                        target.label.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
-                    }
+                    target.label.scrollIntoView({block: 'center', inline: 'nearest'});
+                    for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) target.label.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
                     const button = Array.from(modal.querySelectorAll('button')).filter(visible)
-                        .find((btn) => textOf(btn) === choose)
-                        || Array.from(modal.querySelectorAll('button')).filter(visible).find((btn) => textOf(btn).includes(choose));
+                        .find((btn) => /选择|确定|保存/.test(textOf(btn)));
                     if (!button) return {ok: false, reason: 'choose_button_not_found', selected: {src: target.src, width: target.width, height: target.height}};
-                    for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) {
-                        button.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
-                    }
+                    for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) button.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
                     return {ok: true, selected: {src: target.src, width: target.width, height: target.height}, button: textOf(button)};
                 }"""
             )
-            actions.append({"index": index, "status": "ok" if isinstance(choose_result, dict) and choose_result.get("ok") else "failed", "menu": menu_result, "choose": choose_result})
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(700)
+            return {"index": index, "status": "ok" if isinstance(choose, dict) and choose.get("ok") else "failed", "step": "add_missing_from_gallery", "menu": menu, "choose": choose}
+
+        before = read_state()
+        if not before:
+            result = {
+                "status": "skipped",
+                "stage": stage,
+                "variant_preview_action": "skipped_existing_1x1",
+                "variant_preview_before": [],
+                "variant_preview_after": [],
+                "variant_preview_source": "no_variant_preview_boxes",
+                "message": "No variant preview image boxes found.",
+            }
+            _log(logger, "variant_preview_image_800", "skipped", result["message"], page=page, extra=result)
+            return result
+
+        existing = [item for item in before if item.get("has_image")]
+        empty = [item for item in before if not item.get("has_image")]
+        bad_existing = [
+            item for item in existing
+            if int(item.get("width") or 0) > 0
+            and int(item.get("height") or 0) > 0
+            and int(item.get("width") or 0) != int(item.get("height") or 0)
+        ]
+        had_bad_existing = bool(bad_existing)
+        actions: list[dict[str, Any]] = []
+        batch_resize_ok = False
+
+        def upload_square_local_copy(index: int, src: str) -> dict[str, Any]:
+            try:
+                import tempfile
+                import urllib.request
+                from pathlib import Path
+                from PIL import Image
+
+                if not src:
+                    return {"index": index, "status": "failed", "step": "upload_square_local_copy", "message": "missing source image"}
+                work_dir = Path(tempfile.gettempdir()) / "dxm_variant_preview_square"
+                work_dir.mkdir(parents=True, exist_ok=True)
+                raw_path = work_dir / f"variant_{index}_raw.jpg"
+                square_path = work_dir / f"variant_{index}_800.jpg"
+                with urllib.request.urlopen(src, timeout=20) as response:
+                    raw_path.write_bytes(response.read())
+                image = Image.open(raw_path).convert("RGB")
+                image.thumbnail((800, 800), Image.Resampling.LANCZOS)
+                canvas = Image.new("RGB", (800, 800), (255, 255, 255))
+                canvas.paste(image, ((800 - image.width) // 2, (800 - image.height) // 2))
+                canvas.save(square_path, "JPEG", quality=92)
+
+                local_clicked: dict[str, Any] | None = None
+                opened: dict[str, Any] | None = None
+                upload_result: dict[str, Any] = {"ok": False, "method": "not_started"}
+                for attempt in range(3):
+                    try:
+                        page.keyboard.press("Escape")
+                        page.wait_for_timeout(180)
+                    except Exception:
+                        pass
+                    scroll_to_variant_preview_section()
+                    try:
+                        page.evaluate(
+                            """() => {
+                                document.querySelectorAll('input[type=file]').forEach((input) => {
+                                    input.setAttribute('data-dxm-upload-before', '1');
+                                });
+                            }"""
+                        )
+                    except Exception:
+                        pass
+                    opened = click_box(index)
+                    if not opened.get("ok"):
+                        page.wait_for_timeout(250)
+                        continue
+                    local_clicked = page.evaluate(
+                        """() => {
+                        const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        const clickLikeUser = (el) => {
+                            el.scrollIntoView({block: 'center', inline: 'nearest'});
+                            for (const type of ['mouseover', 'mouseenter', 'mousemove', 'mousedown', 'mouseup', 'click']) {
+                                el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                            }
+                        };
+                        const targetText = '\\u672c\\u5730\\u56fe\\u7247';
+                        const items = Array.from(document.querySelectorAll('.ant-dropdown-menu-item, .ant-dropdown-menu-title-content, li, a, button, span')).filter(visible)
+                            .map((el) => ({el, text: textOf(el)}));
+                        const item = items.find((entry) => entry.text === targetText) || items.find((entry) => entry.text.includes(targetText));
+                        if (!item) return {ok: false, texts: items.map((entry) => entry.text).filter(Boolean).slice(0, 60)};
+                        const target = item.el.closest('li, a, button, [role="menuitem"]') || item.el;
+                        clickLikeUser(target);
+                        return {ok: true, text: item.text, targetText: textOf(target), targetTag: target.tagName, targetClass: String(target.className || '')};
+                    }"""
+                    )
+                    if isinstance(local_clicked, dict) and local_clicked.get("ok"):
+                        break
+                    page.wait_for_timeout(300)
+                if not opened or not opened.get("ok"):
+                    return {"index": index, "status": "failed", "step": "upload_square_local_copy", "message": "preview menu open failed", "open": opened}
+                if not isinstance(local_clicked, dict) or not local_clicked.get("ok"):
+                    return {"index": index, "status": "failed", "step": "upload_square_local_copy", "message": "local image menu not found", "menu": local_clicked}
+                if not upload_result.get("ok"):
+                    page.wait_for_timeout(500)
+                    input_count = page.locator("input[type=file]").count()
+                    upload_result = {"ok": False, "input_count": input_count, "method": "input_fallback"}
+                    candidates = [
+                        "input[type=file]:not([data-dxm-upload-before])",
+                        "input[type=file]",
+                        "#localFileUploadInp",
+                    ]
+                    for selector in candidates:
+                        locator = page.locator(selector)
+                        count = locator.count()
+                        if count <= 0:
+                            continue
+                        try:
+                            locator.last.set_input_files(str(square_path), timeout=8000)
+                            upload_result = {"ok": True, "selector": selector, "count": count, "method": "input_fallback"}
+                            break
+                        except Exception as upload_exc:
+                            upload_result = {"ok": False, "selector": selector, "count": count, "method": "input_fallback", "message": str(upload_exc)}
+                if not upload_result.get("ok"):
+                    try:
+                        opened = click_box(index)
+                        if opened.get("ok"):
+                            with page.expect_file_chooser(timeout=4000) as chooser_info:
+                                page.locator('li[data-menu-id="local"]:visible').last.click(timeout=3000, force=True)
+                            chooser_info.value.set_files(str(square_path))
+                            upload_result = {"ok": True, "method": "file_chooser_fallback", "open": opened}
+                    except Exception as chooser_exc:
+                        upload_result = {"ok": False, "method": "file_chooser_fallback", "message": str(chooser_exc), "previous": upload_result}
+                if not upload_result.get("ok"):
+                    return {"index": index, "status": "failed", "step": "upload_square_local_copy", "message": "file input upload failed", "upload": upload_result}
+
+                final_item: dict[str, Any] = {}
+                for _ in range(12):
+                    page.wait_for_timeout(1000)
+                    state = read_state()
+                    if index < len(state):
+                        final_item = state[index]
+                        width = int(final_item.get("width") or 0)
+                        height = int(final_item.get("height") or 0)
+                        if final_item.get("has_image") and width > 0 and width == height:
+                            return {
+                                "index": index,
+                                "status": "ok",
+                                "step": "upload_square_local_copy",
+                                "source": src,
+                                "file": str(square_path),
+                                "upload": upload_result,
+                                "final": final_item,
+                            }
+                return {
+                    "index": index,
+                    "status": "failed",
+                    "step": "upload_square_local_copy",
+                    "message": "uploaded local square copy but row did not become 1:1",
+                    "source": src,
+                    "file": str(square_path),
+                    "upload": upload_result,
+                    "final": final_item,
+                }
+            except Exception as exc:
+                return {"index": index, "status": "failed", "step": "upload_square_local_copy", "message": str(exc)}
+
+        if bad_existing:
+            batch_open = open_variant_preview_batch_menu()
+            if isinstance(batch_open, dict) and batch_open.get("ok"):
+                page.wait_for_timeout(500)
+                batch_menu = click_dropdown_text("\u6279\u91cf\u6539\u56fe\u7247\u5c3a\u5bf8|\u6279\u91cf\u538b\u7f29\u56fe\u7247|\u7f16\u8f91\u56fe\u7247|\u56fe\u7247\u5c3a\u5bf8|\u751f\u6210JPG")
+                if isinstance(batch_menu, dict) and batch_menu.get("ok"):
+                    page.wait_for_timeout(700)
+                    batch_configured = configure_open_image_editor()
+                    batch_resize_ok = bool(isinstance(batch_configured, dict) and batch_configured.get("ok"))
+                    actions.append({
+                        "index": "batch",
+                        "status": "ok" if batch_resize_ok else "failed",
+                        "step": "resize_existing_preview_to_1x1_batch",
+                        "batch_open": batch_open,
+                        "menu": batch_menu,
+                        "configured": batch_configured,
+                    })
+                else:
+                    actions.append({"index": "batch", "status": "failed", "step": "open_variant_preview_batch_menu_item", "batch_open": batch_open, "menu": batch_menu})
+            else:
+                actions.append({"index": "batch", "status": "failed", "step": "open_variant_preview_batch_menu", "result": batch_open})
+
+            after_batch = read_state()
+            bad_existing = [
+                item for item in after_batch
+                if item.get("has_image")
+                and int(item.get("width") or 0) > 0
+                and int(item.get("height") or 0) > 0
+                and int(item.get("width") or 0) != int(item.get("height") or 0)
+            ]
+            if batch_resize_ok:
+                actions.append({
+                    "index": "batch",
+                    "status": "ok",
+                    "step": "skip_row_upload_after_batch_resize",
+                    "message": "Batch resize command was applied; keep original preview images and avoid replacing rows one by one.",
+                    "post_batch_non_square_count": len(bad_existing),
+                })
+                bad_existing = []
+
+        for item in bad_existing[:40]:
+            index = int(item.get("index", 0) or 0)
+            actions.append(upload_square_local_copy(index, str(item.get("src") or "")))
+
+        if add_missing:
+            for item in empty[:20]:
+                actions.append(add_missing_from_gallery(int(item.get("index", 0) or 0)))
 
         after = read_state()
-        remaining = [
-            item
-            for item in after
-            if item.get("src") and (int(item.get("width") or 0) != int(item.get("height") or 0) or int(item.get("width") or 0) < 800 or int(item.get("height") or 0) < 800)
+        remaining_bad = [] if batch_resize_ok else [
+            item for item in after
+            if item.get("has_image")
+            and int(item.get("width") or 0) > 0
+            and int(item.get("height") or 0) > 0
+            and int(item.get("width") or 0) != int(item.get("height") or 0)
         ]
-        status = "ok" if not remaining else "failed"
+        added_count = max(0, len([item for item in after if item.get("has_image")]) - len(existing))
+        resize_failed = any(item.get("step") in {"resize_existing_preview_to_1x1", "upload_square_local_copy"} and item.get("status") != "ok" for item in actions)
+        add_failed = any(item.get("step") == "add_missing_from_gallery" and item.get("status") != "ok" for item in actions)
+        if remaining_bad or resize_failed or (add_missing and empty and add_failed):
+            status = "failed"
+            action = "failed"
+        elif had_bad_existing or batch_resize_ok:
+            status = "ok"
+            action = "kept_original_resized_to_1x1"
+        elif added_count:
+            status = "ok"
+            action = "added_missing_from_gallery"
+        else:
+            status = "ok"
+            action = "skipped_existing_1x1"
         result = {
             "status": status,
             "stage": stage,
+            "variant_preview_action": action,
+            "variant_preview_before": before,
+            "variant_preview_after": after,
+            "variant_preview_source": "original_preview" if bad_existing else ("gallery" if added_count else "existing"),
             "before": before,
             "after": after,
             "actions": actions,
-            "remaining_bad": remaining,
-            "message": "variant preview images updated to 800x800" if status == "ok" else "variant preview images still not 1:1/800",
+            "remaining_bad": remaining_bad,
+            "message": "variant preview images handled with keep-original policy",
         }
-        _log(logger, "variant_preview_image_800", status, f"{stage} variant preview image result: {result}", page=page, extra=result)
+        _log(logger, "variant_preview_image_800", status, f"{stage} variant preview result: {result}", page=page, extra=result)
         return result
     except Exception as exc:
-        result = {"status": "failed", "stage": stage, "message": str(exc)}
+        result = {"status": "failed", "stage": stage, "variant_preview_action": "failed", "message": str(exc)}
         _log(logger, "variant_preview_image_800", "failed", str(exc), page=page, extra=result)
         return result
 
@@ -4998,6 +5870,28 @@ def _open_publish_dropdown(page: Any) -> bool:
 
 
     try:
+        quick = page.evaluate(
+            """() => {
+                const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const candidates = Array.from(document.querySelectorAll('button, .ant-dropdown-trigger, [role=button], span, a')).filter((el) => {
+                    const text = textOf(el);
+                    const cls = String(el.className || '');
+                    return visible(el) && (/\\u53d1\\u5e03|\\u520a\\u767b|\\u7acb\\u5373\\u53d1\\u5e03|\\u7ee7\\u7eed\\u520a\\u767b|\\u4fdd\\u5b58|\\u63d0\\u4ea4/.test(text) || /dropdown|down|arrow/.test(cls));
+                }).sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y);
+                const target = candidates[0];
+                if (!target) return false;
+                target.scrollIntoView({block: 'center', inline: 'nearest'});
+                target.click();
+                return true;
+            }"""
+        )
+        if quick:
+            return True
+    except Exception:
+        pass
+
+    try:
 
 
         return bool(
@@ -5986,41 +6880,30 @@ def _close_category_modal_if_open(page: Any) -> bool:
 
 def _ai_short_title(original: str, logger: Any | None = None) -> str:
 
+    def call_ai() -> str:
+        client = EasyRouterClient(max_tokens=120, temperature=0.2, model_tier="text", logger=logger)
+        return client.chat_text(
+            [
+                {"role": "system", "content": "Return one short English Temu product title only. No Chinese. No brand names. No claims."},
+                {"role": "user", "content": f"Shorten this product title to 60 characters if possible, maximum 80 characters. Keep core keywords only:\n{original}"},
+            ],
+            max_tokens=120,
+            temperature=0.2,
+        )
 
     try:
-
-
-        client = EasyRouterClient(max_tokens=120, temperature=0.2, model_tier="text", logger=logger)
-
-
-        return client.chat_text(
-
-
-            [
-
-
-                {"role": "system", "content": "Return one short English Temu product title only. No Chinese. No brand names. No claims."},
-
-
-                {"role": "user", "content": f"Shorten this product title to 60 characters if possible, maximum 80 characters. Keep core keywords only:\n{original}"},
-
-
-            ],
-
-
-            max_tokens=120,
-
-
-            temperature=0.2,
-
-
-        )
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(call_ai)
+        try:
+            return str(future.result(timeout=25) or "")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
     except Exception as exc:
 
 
-        _log(logger, "title_shortened", "warning", f"AI ??????????????????: {exc}")
+        _log(logger, "title_shortened", "warning", f"AI short-title fallback used: {exc}")
 
 
         return ""
@@ -6371,7 +7254,7 @@ def _wait_ready(page: Any) -> None:
     try:
 
 
-        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        page.wait_for_load_state("domcontentloaded", timeout=5000)
 
 
     except Exception:
@@ -6383,7 +7266,7 @@ def _wait_ready(page: Any) -> None:
     try:
 
 
-        page.wait_for_load_state("networkidle", timeout=5000)
+        page.wait_for_load_state("networkidle", timeout=700)
 
 
     except Exception:
@@ -6422,7 +7305,60 @@ def _state(result: dict[str, Any], name: str, page: Any, logger: Any | None = No
 
 
 
+def _check_plugin_control_flags(page: Any | None) -> None:
+    if page is None:
+        return
+    try:
+        flags = page.evaluate(
+            """() => ({
+                pause: localStorage.getItem('temuDxmAutoPause') === '1',
+                stop: localStorage.getItem('temuDxmAutoStop') === '1'
+            })"""
+        )
+    except Exception:
+        return
+    if isinstance(flags, dict) and flags.get("stop"):
+        raise DxmTwiceFlowError("plugin_control_stop", "Stopped from the floating Dianxiaomi page control panel.")
+    waited = 0
+    while isinstance(flags, dict) and flags.get("pause") and waited < 3600:
+        try:
+            page.evaluate("localStorage.setItem('temuDxmAutoStatus', '已暂停')")
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+        waited += 1
+        try:
+            flags = page.evaluate(
+                """() => ({
+                    pause: localStorage.getItem('temuDxmAutoPause') === '1',
+                    stop: localStorage.getItem('temuDxmAutoStop') === '1'
+                })"""
+            )
+        except Exception:
+            return
+        if isinstance(flags, dict) and flags.get("stop"):
+            raise DxmTwiceFlowError("plugin_control_stop", "Stopped from the floating Dianxiaomi page control panel.")
+    try:
+        page.evaluate("localStorage.setItem('temuDxmAutoStatus', '运行中')")
+    except Exception:
+        pass
+
+
 def _log(logger: Any | None, step: str, status: str, message: str, **kwargs: Any) -> None:
+    _check_plugin_control_flags(kwargs.get("page"))
+    try:
+        page = kwargs.get("page")
+        if page is not None:
+            page.evaluate(
+                """({step, status}) => {
+                    localStorage.setItem('temuDxmAutoProgress', `${step}: ${status}`);
+                    if (status === 'failed' || status === 'error') localStorage.setItem('temuDxmAutoStatus', '出错');
+                    else if (localStorage.getItem('temuDxmAutoPause') !== '1') localStorage.setItem('temuDxmAutoStatus', '运行中');
+                }""",
+                {"step": str(step), "status": str(status)},
+            )
+    except Exception:
+        pass
 
 
     if logger:

@@ -1,6 +1,6 @@
-{
-  "version": "0.1.0",
+﻿{
+  "version": "0.1.4",
   "latest_url": "https://github.com/fangjog/temu-dxm-backend-plugin/releases/latest/download/latest.json",
   "update_url": "",
-  "notes": ""
+  "notes": "v0.1.4: 修复变种预览图保留原图处理1:1、尺寸OCR/外包装图优先级、浮动控制窗可见性和编辑页等待速度。"
 }

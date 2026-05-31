@@ -169,7 +169,7 @@ def _extract_source_products(page: Any, product_count: int, logger: Any | None =
             "edit_url": page.url,
         }]
     rows: list[dict[str, Any]] = []
-    for attempt in range(8):
+    for attempt in range(4):
         rows = page.evaluate(
             """(limit) => {
                 const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
@@ -223,7 +223,7 @@ def _extract_source_products(page: Any, product_count: int, logger: Any | None =
         rows = rows if isinstance(rows, list) else []
         if rows:
             break
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(700)
     wanted = str(target_title or "").strip().lower()
     if wanted and rows:
         wanted_tokens = _tokens(wanted)
@@ -318,9 +318,9 @@ def _prefer_source_list_page(page: Any) -> Any:
     except Exception:
         pass
     try:
-        target.goto(DRAFT_PRODUCTS_URL, wait_until="domcontentloaded", timeout=20000)
+        target.goto(DRAFT_PRODUCTS_URL, wait_until="domcontentloaded", timeout=12000)
         legacy._wait_ready(target)
-        target.wait_for_timeout(3500)
+        target.wait_for_timeout(900)
     except Exception as exc:
         _log(None, "open_draft_source_list", "warning", f"Could not open draft source list: {exc}", page=target)
     return target
@@ -557,7 +557,7 @@ def _open_source_edit(page: Any, source: dict[str, Any], fallback_index: int, lo
         return page
     edit_url = str(source.get("edit_url") or "").strip()
     if edit_url and "dianxiaomi.com" in edit_url and ("/edit" in edit_url or "quoteEdit" in edit_url):
-        page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(edit_url, wait_until="domcontentloaded", timeout=12000)
         legacy._wait_ready(page)
         if _is_probably_edit_page(page):
             _log(logger, "open_source_product_edit", "ok", f"Opened source product by stored edit URL for #{fallback_index}.", page=page, extra={"edit_url": edit_url})
@@ -636,8 +636,8 @@ def _open_source_edit(page: Any, source: dict[str, Any], fallback_index: int, lo
         if _confirm_copy_store_modal_if_present(page, logger=logger):
             break
         page.wait_for_timeout(800)
-    target_page = _wait_for_probable_edit_page(context, page, before_pages, timeout_ms=22000) or page
-    target_page.wait_for_timeout(1500)
+    target_page = _wait_for_probable_edit_page(context, page, before_pages, timeout_ms=12000) or page
+    target_page.wait_for_timeout(600)
     if not _is_probably_edit_page(target_page):
         extra = {"source": source, "mark": mark}
         try:
@@ -652,9 +652,9 @@ def _return_to_source_list(page: Any, source_list_url: str, logger: Any | None =
     if not source_list_url:
         return page
     try:
-        page.goto(source_list_url, wait_until="domcontentloaded", timeout=20000)
+        page.goto(source_list_url, wait_until="domcontentloaded", timeout=12000)
         legacy._wait_ready(page)
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(900)
         _log(logger, "return_source_list", "ok", "Returned to original Dianxiaomi source list.", page=page)
     except Exception as exc:
         _log(logger, "return_source_list", "failed", f"Could not return to source list: {exc}", page=page)
@@ -972,7 +972,7 @@ def _unique_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _detect_failure_reasons(page: Any, contexts: list[dict[str, Any]], logger: Any | None = None) -> dict[int, str]:
     reasons: dict[int, str] = {}
     try:
-        page.goto(PUBLISH_FAIL_URL, wait_until="domcontentloaded", timeout=20000)
+        page.goto(PUBLISH_FAIL_URL, wait_until="domcontentloaded", timeout=12000)
         legacy._wait_ready(page)
         page.wait_for_timeout(3000)
         records = _extract_visible_rows(page)
@@ -1007,9 +1007,9 @@ def _verify_online_products(page: Any, contexts: list[dict[str, Any]], logger: A
         "online_screenshot_path": "",
     }
     try:
-        page.goto(ONLINE_PRODUCTS_URL, wait_until="domcontentloaded", timeout=20000)
+        page.goto(ONLINE_PRODUCTS_URL, wait_until="domcontentloaded", timeout=12000)
         legacy._wait_ready(page)
-        page.wait_for_timeout(3500)
+        page.wait_for_timeout(1000)
         _click_text(page, ["所有分类"], timeout_ms=1500)
         page.wait_for_timeout(1000)
     except Exception as exc:
@@ -1284,7 +1284,7 @@ def _search_current_list_by_text(page: Any, query: str, logger: Any | None = Non
         )
         if not ok:
             return []
-        page.wait_for_timeout(3500)
+        page.wait_for_timeout(1200)
         records = _extract_visible_rows(page, max_rows=80)
         _log(logger, "verify_search_title", "ok", f"Search verification query returned {len(records)} row(s).", page=page, extra={"query": value[:120]})
         return records
@@ -1336,9 +1336,9 @@ def _verify_publishing_tasks(page: Any, contexts: list[dict[str, Any]], logger: 
     for target in TASK_VERIFY_TARGETS:
         label = str(target["label"])
         try:
-            page.goto(str(target["url"]), wait_until="domcontentloaded", timeout=20000)
+            page.goto(str(target["url"]), wait_until="domcontentloaded", timeout=12000)
             legacy._wait_ready(page)
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(1000)
             if label == "online":
                 _click_text(page, ["所有分类"], timeout_ms=1500)
                 page.wait_for_timeout(1000)
@@ -1469,6 +1469,10 @@ def _image_report_values(image_result: dict[str, Any]) -> dict[str, Any]:
         "set_800px": image_result.get("set_800px_status", "未执行"),
         "child_checked": image_result.get("child_check_status", "未执行"),
         "child_result": image_result.get("child_check_result", "unknown"),
+        "variant_preview_action": image_result.get("variant_preview_action", ""),
+        "variant_preview_before": json.dumps(image_result.get("variant_preview_before", image_result.get("variant_preview_800", {}).get("before", "")), ensure_ascii=False, default=str)[:800],
+        "variant_preview_after": json.dumps(image_result.get("variant_preview_after", image_result.get("variant_preview_800", {}).get("after", "")), ensure_ascii=False, default=str)[:800],
+        "variant_preview_source": image_result.get("variant_preview_source", image_result.get("variant_preview_800", {}).get("variant_preview_source", "")),
     }
 
 
@@ -1531,6 +1535,10 @@ def _write_publishing_reports(contexts: list[dict[str, Any]], verification: dict
                 "图片是否打乱": image["shuffled"],
                 "图片是否800": image["set_800px"],
                 "是否设置800px": image["set_800px"],
+                "variant_preview_action": image["variant_preview_action"],
+                "variant_preview_before": image["variant_preview_before"],
+                "variant_preview_after": image["variant_preview_after"],
+                "variant_preview_source": image["variant_preview_source"],
                 "是否检测儿童图片": image["child_checked"],
                 "儿童图片检测结果": image["child_result"],
                 "SKU原值": task.get("sku_old", ""),
@@ -1543,6 +1551,11 @@ def _write_publishing_reports(contexts: list[dict[str, Any]], verification: dict
                 "新类目": task.get("category_new", ""),
                 "类目": task.get("category_new", "") or task.get("category_old", ""),
                 "尺寸重量来源": size_weight_source,
+                "raw_dimension_text": publish_result.get("raw_dimension_text", ""),
+                "length_cm": publish_result.get("length_cm", ""),
+                "width_cm": publish_result.get("width_cm", ""),
+                "height_cm": publish_result.get("height_cm", ""),
+                "weight_g": publish_result.get("weight_g", ""),
                 "外包装图片来源": package_image_source,
                 "描述图片模块是否补齐": "是" if description_image.get("status") == "ok" else "否",
                 "必填项扫描数量": required_total,
@@ -1642,9 +1655,9 @@ def run_dxm_field_fill_test(page: Any, config: dict[str, Any], logger: Any | Non
     edit_url = str(flow_config.get("edit_url") or "").strip()
     _trim_extra_browser_pages(page, max_pages=1, logger=logger)
     if edit_url:
-        page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(edit_url, wait_until="domcontentloaded", timeout=12000)
         legacy._wait_ready(page)
-        page.wait_for_timeout(1800)
+        page.wait_for_timeout(700)
         edit_page = page
         source = {
             "source_index": 1,
@@ -1682,6 +1695,7 @@ def run_dxm_field_fill_test(page: Any, config: dict[str, Any], logger: Any | Non
     fixed_config["product_defaults"] = defaults
     origin_result = select_origin_country_and_province(edit_page, fixed_config, logger=logger, state=state)
 
+    variant_preview_result = legacy._ensure_variant_preview_images_square_800(edit_page, stage="field_fill_test", logger=logger, add_missing=True)
     package_result = choose_package_image_with_dimension_priority(edit_page, {**context, **dimension_info})
     screenshot_path = legacy._safe_take_screenshot(edit_page, "dxm_field_fill_test_result")
     row = {
@@ -1696,6 +1710,10 @@ def run_dxm_field_fill_test(page: Any, config: dict[str, Any], logger: Any | Non
         "填入重量g": dimension_info.get("weight_g", ""),
         "尺寸重量来源": dimension_info.get("source", ""),
         "重量来源": "fallback" if "weight_fallback" in str(dimension_info.get("source", "")) or dimension_info.get("source") == "fallback_random" else "image_detected",
+        "variant_preview_action": variant_preview_result.get("variant_preview_action", ""),
+        "variant_preview_before": json.dumps(variant_preview_result.get("variant_preview_before", []), ensure_ascii=False, default=str)[:800],
+        "variant_preview_after": json.dumps(variant_preview_result.get("variant_preview_after", []), ensure_ascii=False, default=str)[:800],
+        "variant_preview_source": variant_preview_result.get("variant_preview_source", ""),
         "外包装图片序号": package_result.get("selected_index", ""),
         "外包装图片是否带尺寸": "是" if package_result.get("has_dimension_mark") else "否",
         "外包装图片来源": package_result.get("package_image_source", ""),
@@ -1707,6 +1725,7 @@ def run_dxm_field_fill_test(page: Any, config: dict[str, Any], logger: Any | Non
             f"dimension_status={dimension_result.get('status')}",
             f"package_status={package_result.get('status')}",
             f"origin_status={origin_result.get('status')}",
+            f"variant_preview_action={variant_preview_result.get('variant_preview_action')}",
             f"ocr_debug={dimension_info.get('image_ocr_debug_path', '')}",
             f"package_text={str(package_result.get('selected_image_text', ''))[:200]}",
         ]),
@@ -1721,6 +1740,7 @@ def run_dxm_field_fill_test(page: Any, config: dict[str, Any], logger: Any | Non
         "dimension_info": dimension_info,
         "dimension_result": dimension_result,
         "origin_result": origin_result,
+        "variant_preview_result": variant_preview_result,
         "package_result": package_result,
         "screenshot_path": screenshot_path,
         "reports": reports,

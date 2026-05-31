@@ -99,6 +99,9 @@ def save_settings(settings: dict) -> None:
         "version": str(settings.get("version") or ""),
         "api_key_masked": mask_secret(str(settings.get("api_key") or "")),
         "dxm_username_masked": mask_secret(str(settings.get("dxm_username") or "")),
+        "api_test_ok": bool(settings.get("api_test_ok") or False),
+        "api_test_at": str(settings.get("api_test_at") or ""),
+        "api_test_message": str(settings.get("api_test_message") or "")[:500],
     }
     protected = {}
     for key in ("api_key", "dxm_username", "dxm_password"):
